@@ -7,8 +7,9 @@ GPU persistent kernel이 CPU 개입 없이 자율적으로 NVMe I/O를 submit/co
 
 ## Prerequisites
 
-- NVIDIA GPU (Volta 이상, PCIe P2P 지원)
-- CUDA Toolkit 10.2+
+- NVIDIA GPU (Ampere 이상, PCIe P2P 지원)
+- CUDA Toolkit 13.x+
+- GCC 11 (GCC 13은 libnvm의 freestanding libcxx와 비호환)
 - CMake 3.18+
 - libnvm kernel module (extern/bam/module)
 - Linux kernel 5.x+
@@ -17,7 +18,7 @@ GPU persistent kernel이 CPU 개입 없이 자율적으로 NVMe I/O를 submit/co
 ## Build
 
 ```bash
-# 1. submodule 초기화
+# 1. submodule 초기화 (freestanding libcxx 포함)
 git submodule update --init --recursive
 
 # 2. fio 빌드 (config-host.h 생성 필요)
@@ -26,17 +27,43 @@ cd extern/fio
 make -j$(nproc)
 cd ../..
 
-# 3. libnvm 커널 모듈 빌드 및 로드
+# 3. libnvm(BAM) 빌드
+cd extern/bam
+mkdir -p build && cd build
+cmake .. \
+    -Dno_smartio=true \
+    -Dno_module=true \
+    -Dno_fio=true \
+    -DCMAKE_CUDA_ARCHITECTURES="80;90" \
+    -DCMAKE_CXX_COMPILER=g++-11 \
+    -DCMAKE_C_COMPILER=gcc-11 \
+    -DCMAKE_CUDA_HOST_COMPILER=g++-11 \
+    -DCMAKE_CXX_FLAGS="-I${PWD}/../include/freestanding/include" \
+    -DCMAKE_C_FLAGS="-I${PWD}/../include/freestanding/include"
+make -j$(nproc)
+cd ../../..
+
+# 4. (선택) libnvm 커널 모듈 빌드 및 로드
 cd extern/bam/module
 make
 sudo insmod libnvm.ko
 cd ../../..
 
-# 4. parallelink 빌드
-mkdir build && cd build
-cmake ..
+# 5. parallelink 빌드
+mkdir -p build && cd build
+cmake .. \
+    -DCMAKE_CUDA_ARCHITECTURES="80;90" \
+    -DCMAKE_CXX_COMPILER=g++-11 \
+    -DCMAKE_C_COMPILER=gcc-11 \
+    -DCMAKE_CUDA_HOST_COMPILER=g++-11
 make -j$(nproc)
 ```
+
+### Build Notes
+
+- **GCC 11 필수**: libnvm의 freestanding libcxx(`simt/atomic`)가 GCC 13의 엄격한 `chrono::duration` 규칙과 비호환. GCC 11 사용 시 정상 빌드.
+- **CUDA arch 80/90**: `compute_70`(Volta)은 CUDA 13.x에서 제거됨. Ampere(80) 이상 지정.
+- **freestanding include**: libnvm이 `simt/atomic` 헤더를 사용하며, 이는 `extern/bam/include/freestanding/include`에 위치.
 
 빌드 산출물:
 - `parallelink.so` : fio external ioengine

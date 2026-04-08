@@ -26,6 +26,7 @@ set(FIO_INCLUDE_DIRS
 # -------------------------------------------------------------------
 set(LIBNVM_INCLUDE_DIRS
     ${LIBNVM_DIR}/include
+    ${LIBNVM_DIR}/include/freestanding/include
     ${LIBNVM_DIR}/src
 )
 
@@ -50,6 +51,10 @@ target_include_directories(parallelink PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${FIO_INCLUDE_DIRS}
     ${LIBNVM_INCLUDE_DIRS}
+)
+
+target_compile_definitions(parallelink PRIVATE
+    _GNU_SOURCE
 )
 
 target_link_libraries(parallelink PRIVATE
