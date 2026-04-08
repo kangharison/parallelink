@@ -1,0 +1,6 @@
+[submodule "extern/fio"]
+	path = extern/fio
+	url = https://github.com/axboe/fio.git
+[submodule "extern/bam"]
+	path = extern/bam
+	url = https://github.com/ZaidQureshi/bam.git
