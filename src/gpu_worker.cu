@@ -1,5 +1,5 @@
 /*
- * GPU-side persistent kernel for BAM fio engine
+ * parallelink: GPU-side persistent kernel
  *
  * Each GPU thread autonomously:
  *   1. Builds an NVMe command
@@ -14,9 +14,9 @@
 #include <cstdio>
 #include <cstring>
 
-#include "bam_engine.h"
+#include "plink_engine.h"
 
-/* BAM headers */
+/* libnvm headers (from extern/bam) */
 #include "nvm_parallel_queue.h"
 #include "nvm_cmd.h"
 #include "ctrl.h"
@@ -48,8 +48,8 @@ __device__ static uint64_t next_lba_sequential(uint64_t lba_range,
 /*  Persistent I/O kernel                                             */
 /* ------------------------------------------------------------------ */
 
-__global__ void bam_io_worker(struct bam_shared_state *state,
-			      QueuePair *qps, int n_queues)
+__global__ void plink_io_worker(struct plink_shared_state *state,
+				QueuePair *qps, int n_queues)
 {
 	int tid = threadIdx.x + blockIdx.x * blockDim.x;
 	if (tid >= state->total_threads)
@@ -107,28 +107,28 @@ __global__ void bam_io_worker(struct bam_shared_state *state,
 }
 
 /* ------------------------------------------------------------------ */
-/*  Host-side interface (called from engine.c)                        */
+/*  Host-side interface (called from gpu-engine.c)                    */
 /* ------------------------------------------------------------------ */
 
-extern "C" int bam_gpu_init(struct bam_shared_state **state,
-			    int gpu_id, const char *nvme_dev,
-			    int n_queues, int queue_depth)
+extern "C" int plink_gpu_init(struct plink_shared_state **state,
+			      int gpu_id, const char *nvme_dev,
+			      int n_queues, int queue_depth)
 {
 	cudaError_t err = cudaSetDevice(gpu_id);
 	if (err != cudaSuccess) {
-		fprintf(stderr, "bam: cudaSetDevice(%d) failed: %s\n",
+		fprintf(stderr, "parallelink: cudaSetDevice(%d) failed: %s\n",
 			gpu_id, cudaGetErrorString(err));
 		return -1;
 	}
 
 	/* Allocate shared state in managed memory (CPU+GPU accessible) */
-	err = cudaMallocManaged(state, sizeof(struct bam_shared_state));
+	err = cudaMallocManaged(state, sizeof(struct plink_shared_state));
 	if (err != cudaSuccess) {
-		fprintf(stderr, "bam: cudaMallocManaged failed: %s\n",
+		fprintf(stderr, "parallelink: cudaMallocManaged failed: %s\n",
 			cudaGetErrorString(err));
 		return -1;
 	}
-	memset(*state, 0, sizeof(struct bam_shared_state));
+	memset(*state, 0, sizeof(struct plink_shared_state));
 
 	/*
 	 * TODO: Full initialization sequence:
@@ -144,8 +144,8 @@ extern "C" int bam_gpu_init(struct bam_shared_state **state,
 	return 0;
 }
 
-extern "C" int bam_gpu_launch(struct bam_shared_state *state,
-			      int gpu_warps, int n_queues)
+extern "C" int plink_gpu_launch(struct plink_shared_state *state,
+				int gpu_warps, int n_queues)
 {
 	int threads_per_block = 128;
 	int total_threads = gpu_warps * 32;
@@ -153,12 +153,12 @@ extern "C" int bam_gpu_launch(struct bam_shared_state *state,
 
 	/*
 	 * TODO: pass actual QueuePair device pointer
-	 * bam_io_worker<<<n_blocks, threads_per_block>>>(state, d_qps, n_queues);
+	 * plink_io_worker<<<n_blocks, threads_per_block>>>(state, d_qps, n_queues);
 	 */
 
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) {
-		fprintf(stderr, "bam: kernel launch failed: %s\n",
+		fprintf(stderr, "parallelink: kernel launch failed: %s\n",
 			cudaGetErrorString(err));
 		return -1;
 	}
@@ -166,7 +166,7 @@ extern "C" int bam_gpu_launch(struct bam_shared_state *state,
 	return 0;
 }
 
-extern "C" void bam_gpu_shutdown(struct bam_shared_state *state)
+extern "C" void plink_gpu_shutdown(struct plink_shared_state *state)
 {
 	if (!state)
 		return;

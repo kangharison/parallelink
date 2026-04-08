@@ -1,15 +1,15 @@
 /*
- * bam-holder: resident process that keeps GPU memory and NVMe state
+ * plink-holder: resident process that keeps GPU memory and NVMe state
  * alive across fio test runs.
  *
  * Without this, every fio run would require a full NVMe controller
  * reset + queue recreation + GPU DMA remapping (~200-1000ms).
  *
  * Usage:
- *   $ bam-holder --nvme=/dev/libnvm0 --gpu=0 --queues=32
+ *   $ plink-holder --nvme=/dev/libnvm0 --gpu=0 --queues=32
  *   (runs in foreground, Ctrl-C to release resources)
  *
- * fio connects via CUDA IPC handles stored in BAM_STATE_PATH.
+ * fio connects via CUDA IPC handles stored in PLINK_STATE_PATH.
  */
 
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@
 #include <csignal>
 #include <unistd.h>
 
-#include "bam_engine.h"
+#include "plink_engine.h"
 
 static volatile int running = 1;
 
@@ -74,12 +74,12 @@ int main(int argc, char **argv)
 	 *   3. nvm_dma_map_device() for each GPU allocation
 	 *   4. nvm_admin_sq_create / cq_create
 	 *   5. cudaIpcGetMemHandle() for each allocation
-	 *   6. Save handles to BAM_STATE_PATH
+	 *   6. Save handles to PLINK_STATE_PATH
 	 */
 
-	fprintf(stderr, "bam-holder: ready (gpu=%d, nvme=%s, queues=%d)\n",
+	fprintf(stderr, "plink-holder: ready (gpu=%d, nvme=%s, queues=%d)\n",
 		gpu_id, nvme_dev, n_queues);
-	fprintf(stderr, "bam-holder: holding GPU memory. Ctrl-C to release.\n");
+	fprintf(stderr, "plink-holder: holding GPU memory. Ctrl-C to release.\n");
 
 	while (running)
 		sleep(1);
@@ -90,9 +90,9 @@ int main(int argc, char **argv)
 	 *   2. nvm_dma_unmap
 	 *   3. cudaFree all allocations
 	 *   4. nvm_ctrl_free
-	 *   5. Remove BAM_STATE_PATH
+	 *   5. Remove PLINK_STATE_PATH
 	 */
 
-	fprintf(stderr, "bam-holder: shutting down\n");
+	fprintf(stderr, "plink-holder: shutting down\n");
 	return 0;
 }
