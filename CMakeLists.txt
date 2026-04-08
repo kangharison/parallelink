@@ -42,7 +42,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 #  fio loads external engines via dlopen("parallelink.so").
 # -------------------------------------------------------------------
 add_library(parallelink SHARED
-    src/gpu-engine.c
+    src/gpu_engine.c
     src/gpu_worker.cu
 )
 
