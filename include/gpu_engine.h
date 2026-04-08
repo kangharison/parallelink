@@ -1,5 +1,5 @@
-#ifndef PLINK_ENGINE_H
-#define PLINK_ENGINE_H
+#ifndef GPU_ENGINE_H
+#define GPU_ENGINE_H
 
 #include <stdint.h>
 
@@ -63,4 +63,4 @@ void plink_gpu_shutdown(struct plink_shared_state *state);
 }
 #endif
 
-#endif /* PLINK_ENGINE_H */
+#endif /* GPU_ENGINE_H */

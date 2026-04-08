@@ -19,7 +19,7 @@
 #include "fio.h"
 #include "optgroup.h"
 
-#include "plink_engine.h"
+#include "gpu_engine.h"
 
 struct plink_options {
 	struct thread_data *td;

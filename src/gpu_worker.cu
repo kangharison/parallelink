@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "plink_engine.h"
+#include "gpu_engine.h"
 
 /* libnvm headers (from extern/bam) */
 #include "nvm_parallel_queue.h"

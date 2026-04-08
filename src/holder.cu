@@ -19,7 +19,7 @@
 #include <csignal>
 #include <unistd.h>
 
-#include "plink_engine.h"
+#include "gpu_engine.h"
 
 static volatile int running = 1;
 
