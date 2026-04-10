@@ -212,7 +212,18 @@ static int fio_plink_close_file(struct thread_data *td, struct fio_file *f)
 /*  Engine registration                                               */
 /* ------------------------------------------------------------------ */
 
-static struct ioengine_ops ioengine = {
+/*
+ * External engine: ioengine_ops must be non-static so that fio can
+ * find it via dlsym() when loading the .so at runtime.
+ *
+ * fio tries these symbols in order (ioengines.c:dlopen_ioengine):
+ *   1. dlsym(dlhandle, "<engine_name>")   → "parallelink"
+ *   2. dlsym(dlhandle, "ioengine")
+ *   3. dlsym(dlhandle, "get_ioengine")    → function call
+ *
+ * By naming the struct "ioengine" (non-static), method 2 will match.
+ */
+struct ioengine_ops ioengine = {
 	.name               = "parallelink",
 	.version            = FIO_IOOPS_VERSION,
 	.flags              = FIO_NOEXTEND | FIO_NODISKUTIL |
@@ -228,13 +239,3 @@ static struct ioengine_ops ioengine = {
 	.options            = options,
 	.option_struct_size = sizeof(struct plink_options),
 };
-
-static void fio_init fio_plink_register(void)
-{
-	register_ioengine(&ioengine);
-}
-
-static void fio_exit fio_plink_unregister(void)
-{
-	unregister_ioengine(&ioengine);
-}
