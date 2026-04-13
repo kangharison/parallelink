@@ -24,7 +24,7 @@ DIST="${ROOT}/dist"
 
 CUDA_ARCHS="${CUDA_ARCHS:-100;120}"     # Blackwell
 JOBS="${JOBS:-$(nproc)}"
-BUILD_TYPE="${BUILD_TYPE:-Release}"     # Debug | Release
+BUILD_TYPE="${BUILD_TYPE:-Debug}"       # Debug | Release
 NVCC="${NVCC:-/usr/local/cuda/bin/nvcc}"
 
 # 호스트 컴파일러 자동 선택:
