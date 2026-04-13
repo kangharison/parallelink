@@ -1,0 +1,48 @@
+commit 43c7cde4747c806b3f50ebd0778078bb5cb75afa
+Author: Jaewoong Jung <jaew.jung@samsung.com>
+Date:   Thu Mar 26 18:47:38 2026 +0000
+
+    feat: use latest kernel APIs
+
+diff --git a/module/map.c b/module/map.c
+index baccb4c..8e32b4b 100644
+--- a/module/map.c
++++ b/module/map.c
+@@ -147,8 +147,11 @@ static long map_user_pages(struct map* map)
+ #elif LINUX_VERSION_CODE <= KERNEL_VERSION(4, 8, 17)
+ #warning "Building for older kernel, not properly tested"
+     retval = get_user_pages(map->vaddr, map->n_addrs, 1, 0, pages, NULL);
+-#else
++#elif LINUX_VERSION_CODE <= KERNEL_VERSION(6, 4, 16)
++#warning "Building for older kernel, not properly tested"
+     retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages, NULL);
++#else
++    retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages);
+ #endif
+     if (retval <= 0)
+     {
+diff --git a/module/pci.c b/module/pci.c
+index c19f1f5..b921ed8 100644
+--- a/module/pci.c
++++ b/module/pci.c
+@@ -12,6 +12,7 @@
+ #include <linux/err.h>
+ #include <linux/device.h>
+ #include <linux/uaccess.h>
++#include <linux/version.h>
+ #include <asm/io.h>
+ #include <asm/errno.h>
+ #include <asm/page.h>
+@@ -328,7 +329,12 @@ static int __init libnvm_helper_entry(void)
+     }
+ 
+     // Create character device class
++#if LINUX_VERSION_CODE <= KERNEL_VERSION(6, 3, 13)
++#warning "Building for older kernel, not properly tested"
+     dev_class = class_create(THIS_MODULE, DRIVER_NAME);
++#else
++    dev_class = class_create(DRIVER_NAME);
++#endif
+     if (IS_ERR(dev_class))
+     {
+         unregister_chrdev_region(dev_first, max_num_ctrls);

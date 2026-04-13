@@ -80,15 +80,16 @@ echo "    NVCC       = ${NVCC}"
 # Apply BaM cmake patch (idempotent) — adds Debug/Release switching
 # to extern/bam/CMakeLists.txt since upstream has it hardcoded.
 # ------------------------------------------------------------------
-BAM_PATCH="${ROOT}/patches/bam-build-type.patch"
-if [[ -f "${BAM_PATCH}" ]]; then
-    if git -C "${BAM_DIR}" apply --reverse --check "${BAM_PATCH}" >/dev/null 2>&1; then
-        echo "==> BaM patch already applied"
-    else
-        echo "==> Applying BaM build-type patch"
-        git -C "${BAM_DIR}" apply "${BAM_PATCH}"
+for BAM_PATCH in "${ROOT}"/patches/bam-*.patch; do
+    if [[ -f "${BAM_PATCH}" ]]; then
+        if git -C "${BAM_DIR}" apply --reverse --check "${BAM_PATCH}" >/dev/null 2>&1; then
+            echo "==> ${BAM_PATCH} already applied"
+        else
+            echo "==> Applying ${BAM_PATCH}"
+            git -C "${BAM_DIR}" apply "${BAM_PATCH}"
+        fi
     fi
-fi
+done
 
 # ------------------------------------------------------------------
 # 0. Submodules
