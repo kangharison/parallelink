@@ -73,7 +73,10 @@ popd >/dev/null
 echo "==> [2/4] Build libnvm (BaM) userspace + kernel module"
 mkdir -p "${BAM_BUILD}"
 pushd "${BAM_BUILD}" >/dev/null
-if [[ ! -f CMakeCache.txt ]]; then
+CACHED_TYPE="$(grep -E '^CMAKE_BUILD_TYPE' CMakeCache.txt 2>/dev/null | cut -d= -f2 || true)"
+if [[ ! -f CMakeCache.txt || "${CACHED_TYPE}" != "${BUILD_TYPE}" ]]; then
+    echo "    (re)configuring BaM (cached=${CACHED_TYPE:-none} requested=${BUILD_TYPE})"
+    rm -f CMakeCache.txt
     cmake .. \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -Dno_smartio=true \
@@ -112,7 +115,10 @@ fi
 echo "==> [3/4] Build parallelink"
 mkdir -p "${PLINK_BUILD}"
 pushd "${PLINK_BUILD}" >/dev/null
-if [[ ! -f CMakeCache.txt ]]; then
+CACHED_TYPE="$(grep -E '^CMAKE_BUILD_TYPE' CMakeCache.txt 2>/dev/null | cut -d= -f2 || true)"
+if [[ ! -f CMakeCache.txt || "${CACHED_TYPE}" != "${BUILD_TYPE}" ]]; then
+    echo "    (re)configuring parallelink (cached=${CACHED_TYPE:-none} requested=${BUILD_TYPE})"
+    rm -f CMakeCache.txt
     cmake .. \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
