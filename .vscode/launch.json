@@ -1,0 +1,57 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "parallelink: CUDA + C/C++ (cuda-gdb)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/dist/fio",
+            "args": [
+                "--ioengine=external:parallelink.so",
+                "--name=gpu-randread",
+                "--rw=randread",
+                "--bs=4k",
+                "--size=1G",
+                "--runtime=10",
+                "--time_based",
+                "--gpu_warps=4",
+                "--n_queues=2",
+                "--nvme_dev=/dev/libnvm0"
+            ],
+            "cwd": "${workspaceFolder}/dist",
+            "environment": [
+                { "name": "FIO_EXT_ENG_DIR", "value": "${workspaceFolder}/dist" },
+                { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/dist" }
+            ],
+            "debuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+            "stopAtEntry": false,
+            "breakOnLaunch": false
+        },
+        {
+            "name": "parallelink: host only (gdb)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/dist/fio",
+            "args": [
+                "--ioengine=external:parallelink.so",
+                "--name=gpu-randread",
+                "--rw=randread",
+                "--bs=4k",
+                "--size=1G",
+                "--runtime=10",
+                "--time_based",
+                "--gpu_warps=4",
+                "--n_queues=2",
+                "--nvme_dev=/dev/libnvm0"
+            ],
+            "cwd": "${workspaceFolder}/dist",
+            "environment": [
+                { "name": "FIO_EXT_ENG_DIR", "value": "${workspaceFolder}/dist" },
+                { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/dist" }
+            ],
+            "MIMode": "gdb",
+            "stopAtEntry": false,
+            "externalConsole": false
+        }
+    ]
+}
