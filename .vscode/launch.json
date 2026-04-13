@@ -7,6 +7,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/extern/fio/fio",
             "args": [
+                "--thread",
+                "--numjobs=1",
                 "--ioengine=external:${workspaceFolder}/build/parallelink.so",
                 "--name=gpu-randread",
                 "--rw=randread",
@@ -24,6 +26,13 @@
                 { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/extern/bam/build/lib" }
             ],
             "debuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+            "setupCommands": [
+                { "text": "set breakpoint pending on" },
+                { "text": "set follow-fork-mode child" },
+                { "text": "set detach-on-fork off" },
+                { "text": "set print thread-events on" },
+                { "text": "set cuda break_on_launch application" }
+            ],
             "stopAtEntry": false,
             "breakOnLaunch": false
         },
@@ -33,6 +42,8 @@
             "request": "launch",
             "program": "${workspaceFolder}/extern/fio/fio",
             "args": [
+                "--thread",
+                "--numjobs=1",
                 "--ioengine=external:${workspaceFolder}/build/parallelink.so",
                 "--name=gpu-randread",
                 "--rw=randread",
@@ -50,6 +61,11 @@
                 { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/extern/bam/build/lib" }
             ],
             "MIMode": "gdb",
+            "setupCommands": [
+                { "text": "-gdb-set breakpoint pending on" },
+                { "text": "-gdb-set follow-fork-mode child" },
+                { "text": "-gdb-set detach-on-fork off" }
+            ],
             "stopAtEntry": false,
             "externalConsole": false
         }
