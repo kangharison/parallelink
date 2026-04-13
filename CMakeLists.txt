@@ -38,6 +38,16 @@ find_package(CUDAToolkit REQUIRED)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 
 # -------------------------------------------------------------------
+#  libnvm (BaM) prebuilt shared library
+#  Expected location: extern/bam/build/lib/libnvm.so
+# -------------------------------------------------------------------
+set(LIBNVM_LIB ${LIBNVM_DIR}/build/lib/libnvm.so)
+if(NOT EXISTS ${LIBNVM_LIB})
+    message(WARNING "libnvm.so not found at ${LIBNVM_LIB}. "
+                    "Build extern/bam first (see README).")
+endif()
+
+# -------------------------------------------------------------------
 #  Engine shared library: parallelink.so
 #
 #  fio loads external engines via dlopen("parallelink.so").
@@ -57,8 +67,14 @@ target_compile_definitions(parallelink PRIVATE
     _GNU_SOURCE
 )
 
+# BaM headers use __CUDA__ to gate device-side code paths.
+set_source_files_properties(src/gpu_worker.cu PROPERTIES
+    COMPILE_DEFINITIONS "__CUDA__"
+)
+
 target_link_libraries(parallelink PRIVATE
     CUDA::cudart
+    ${LIBNVM_LIB}
 )
 
 # fio expects the engine symbol to be visible
