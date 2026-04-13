@@ -28,8 +28,6 @@
             "debuggerPath": "/usr/local/cuda/bin/cuda-gdb",
             "setupCommands": [
                 { "text": "set breakpoint pending on" },
-                { "text": "set follow-fork-mode child" },
-                { "text": "set detach-on-fork off" },
                 { "text": "set print thread-events on" },
                 { "text": "set cuda break_on_launch application" }
             ],
