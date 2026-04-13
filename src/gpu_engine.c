@@ -113,7 +113,7 @@ static int fio_plink_init(struct thread_data *td)
 	if (!pd)
 		return -ENOMEM;
 
-	pd->ring_size = td->o.iodepth ? td->o.iodepth : 1;
+	pd->ring_size = td->o.iodepth ? td->o.iodepth : 256;
 	pd->queued = calloc(pd->ring_size, sizeof(*pd->queued));
 	if (!pd->queued) {
 		free(pd);
@@ -121,7 +121,7 @@ static int fio_plink_init(struct thread_data *td)
 	}
 
 	ret = plink_gpu_init(&pd->state, o->gpu_id, o->nvme_dev,
-			     o->n_queues, td->o.iodepth);
+			     o->n_queues, 256);
 	if (ret) {
 		log_err("parallelink: GPU init failed (ret=%d). "
 			"Is libnvm loaded? (insmod libnvm.ko)\n", ret);
