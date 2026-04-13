@@ -7,7 +7,11 @@
 #   4. collect into dist/
 #
 # Target GPU: NVIDIA Blackwell (sm_100 / sm_120).
-# Requires: gcc-11 / g++-11, CUDA 13.x, cmake >= 3.18, kernel headers.
+# Requires: gcc-12 / g++-12 (CUDA 13.x host compiler 지원 범위), CUDA 13.x,
+#           cmake >= 3.18, kernel headers.
+#
+# 기본값은 gcc-12/g++-12. 다른 버전을 쓰려면 CC/CXX/CUDA_HOST_CXX env로 오버라이드.
+# 예) CC=/usr/bin/gcc-13 CXX=/usr/bin/g++-13 CUDA_HOST_CXX=/usr/bin/g++-13 ./build.sh
 
 set -euo pipefail
 
@@ -21,11 +25,49 @@ DIST="${ROOT}/dist"
 CUDA_ARCHS="${CUDA_ARCHS:-100;120}"     # Blackwell
 JOBS="${JOBS:-$(nproc)}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"     # Debug | Release
-
-CC="${CC:-gcc-11}"
-CXX="${CXX:-g++-11}"
-CUDA_HOST_CXX="${CUDA_HOST_CXX:-g++-11}"
 NVCC="${NVCC:-/usr/local/cuda/bin/nvcc}"
+
+# 호스트 컴파일러 자동 선택:
+#   1) env로 넘어온 CC/CXX/CUDA_HOST_CXX가 있으면 그대로 사용 (최우선)
+#   2) gcc-12/g++-12가 설치돼 있으면 그것을 사용 (CUDA 13.x 권장)
+#   3) 아니면 시스템 기본 gcc/g++ 사용 — 단 주 버전이 12 또는 13일 때만 허용
+# (CUDA 13.x host compiler 지원: GCC 8~14. 14 초과는 런타임에 실패 가능.)
+_pick_compiler() {
+    local preferred="$1" fallback="$2"
+    if command -v "${preferred}" >/dev/null 2>&1; then
+        echo "${preferred}"
+    elif command -v "${fallback}" >/dev/null 2>&1; then
+        echo "${fallback}"
+    else
+        echo ""
+    fi
+}
+CC="${CC:-$(_pick_compiler gcc-12 gcc)}"
+CXX="${CXX:-$(_pick_compiler g++-12 g++)}"
+CUDA_HOST_CXX="${CUDA_HOST_CXX:-${CXX}}"
+
+# 존재 검증 + 주 버전 확인 (nvcc의 모호한 에러를 선차단)
+for _bin in "${CC}" "${CXX}" "${CUDA_HOST_CXX}"; do
+    if [[ -z "${_bin}" ]] || ! command -v "${_bin}" >/dev/null 2>&1; then
+        echo "ERROR: host compiler not found. 설치된 gcc/g++가 없습니다." >&2
+        echo "       해결: sudo apt install gcc-12 g++-12" >&2
+        echo "       또는 CC=... CXX=... CUDA_HOST_CXX=... 로 오버라이드" >&2
+        exit 1
+    fi
+done
+_CXX_MAJOR="$("${CXX}" -dumpversion 2>/dev/null | cut -d. -f1)"
+if [[ "${_CXX_MAJOR}" -lt 8 || "${_CXX_MAJOR}" -gt 14 ]]; then
+    echo "ERROR: CXX=${CXX} 버전 major=${_CXX_MAJOR} — CUDA 13.x는 GCC 8~14 지원." >&2
+    exit 1
+fi
+echo "    selected CXX = ${CXX} (major=${_CXX_MAJOR})"
+
+# CMake가 암묵적으로 읽는 CUDA 관련 env를 본 스크립트 범위에서 무력화.
+# 사용자 쉘에 `export CUDAHOSTCXX=g++11` 같은 오타가 남아 있어도, 여기서 명시
+# 선택한 CUDA_HOST_CXX가 항상 우선하도록 export 고정한다.
+export CUDAHOSTCXX="${CUDA_HOST_CXX}"
+export CUDACXX="${NVCC}"
+unset CCBIN
 
 echo "==> parallelink build"
 echo "    BUILD_TYPE = ${BUILD_TYPE}"
