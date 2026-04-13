@@ -6,6 +6,23 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CUDA_STANDARD 14)
 
 # -------------------------------------------------------------------
+#  Build type: Debug / Release (default: Release)
+#   Debug  : -g -O0 host + -G -g -O0 device (cuda-gdb breakpoints)
+#   Release: -O2 host  + -lineinfo -O3 device
+# -------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING
+        "Choose build type: Debug Release" FORCE)
+endif()
+message(STATUS "parallelink build type: ${CMAKE_BUILD_TYPE}")
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -O0")
+else()
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo -O3")
+endif()
+
+# -------------------------------------------------------------------
 #  Paths
 # -------------------------------------------------------------------
 set(FIO_DIR    ${CMAKE_SOURCE_DIR}/extern/fio)
@@ -65,6 +82,7 @@ target_include_directories(parallelink PRIVATE
 
 target_compile_definitions(parallelink PRIVATE
     _GNU_SOURCE
+    PLINK_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
 )
 
 # BaM headers use __CUDA__ to gate device-side code paths.

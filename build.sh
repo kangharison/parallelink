@@ -20,6 +20,7 @@ DIST="${ROOT}/dist"
 
 CUDA_ARCHS="${CUDA_ARCHS:-100;120}"     # Blackwell
 JOBS="${JOBS:-$(nproc)}"
+BUILD_TYPE="${BUILD_TYPE:-Release}"     # Debug | Release
 
 CC="${CC:-gcc-11}"
 CXX="${CXX:-g++-11}"
@@ -27,10 +28,25 @@ CUDA_HOST_CXX="${CUDA_HOST_CXX:-g++-11}"
 NVCC="${NVCC:-/usr/local/cuda/bin/nvcc}"
 
 echo "==> parallelink build"
+echo "    BUILD_TYPE = ${BUILD_TYPE}"
 echo "    CUDA_ARCHS = ${CUDA_ARCHS}"
 echo "    JOBS       = ${JOBS}"
 echo "    CC/CXX     = ${CC} / ${CXX}"
 echo "    NVCC       = ${NVCC}"
+
+# ------------------------------------------------------------------
+# Apply BaM cmake patch (idempotent) — adds Debug/Release switching
+# to extern/bam/CMakeLists.txt since upstream has it hardcoded.
+# ------------------------------------------------------------------
+BAM_PATCH="${ROOT}/patches/bam-build-type.patch"
+if [[ -f "${BAM_PATCH}" ]]; then
+    if git -C "${BAM_DIR}" apply --reverse --check "${BAM_PATCH}" >/dev/null 2>&1; then
+        echo "==> BaM patch already applied"
+    else
+        echo "==> Applying BaM build-type patch"
+        git -C "${BAM_DIR}" apply "${BAM_PATCH}"
+    fi
+fi
 
 # ------------------------------------------------------------------
 # 0. Submodules
@@ -59,6 +75,7 @@ mkdir -p "${BAM_BUILD}"
 pushd "${BAM_BUILD}" >/dev/null
 if [[ ! -f CMakeCache.txt ]]; then
     cmake .. \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -Dno_smartio=true \
         -Dno_module=false \
         -Dno_fio=true \
@@ -75,7 +92,10 @@ make -j"${JOBS}"
 # Build the kernel module. BaM generates build/module/Makefile from
 # module/Makefile.in via cmake variable substitution.
 if [[ -f module/Makefile ]]; then
-    make -C module -j"${JOBS}"
+    if ! make -C module -j"${JOBS}"; then
+        echo "WARN: libnvm.ko build failed (kernel headers mismatch?)" >&2
+        echo "      Userspace parallelink build will continue." >&2
+    fi
 else
     echo "WARN: ${BAM_BUILD}/module/Makefile not found — skipping .ko build" >&2
 fi
@@ -94,6 +114,7 @@ mkdir -p "${PLINK_BUILD}"
 pushd "${PLINK_BUILD}" >/dev/null
 if [[ ! -f CMakeCache.txt ]]; then
     cmake .. \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DCMAKE_CXX_COMPILER="${CXX}" \
         -DCMAKE_C_COMPILER="${CC}" \

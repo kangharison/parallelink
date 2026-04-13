@@ -1,0 +1,38 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,12 +42,30 @@ foreach (flag ${convert_warnings})
+     string (APPEND flags " -Werror=${flag}")
+ endforeach()
+ set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra ${flags}" CACHE INTERNAL "" FORCE)
+-set (CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_DEBUG} -g -DDEBUG" CACHE INTERNAL "" FORCE)
+-set (CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
+ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -std=c++11" CACHE INTERNAL "" FORCE)
+-set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG} -g -DDEBUG " CACHE INTERNAL "" FORCE)
+-set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -std=c++11" CACHE INTERNAL "" FORCE)
+-set (CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -lineinfo -D__CUDA__ -D__CUDACC__ -O3;-std=c++11;${GPU_ARCHS}")
++
++# ------------------------------------------------------------------
++# parallelink patch: explicit Debug / Release selection for host+device
++# ------------------------------------------------------------------
++if (NOT CMAKE_BUILD_TYPE)
++    set (CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose build type: Debug Release" FORCE)
++endif ()
++message (STATUS "BaM build type: ${CMAKE_BUILD_TYPE}")
++
++# Host flags
++set (CMAKE_C_FLAGS_DEBUG     "-g -O0 -DDEBUG"             CACHE STRING "" FORCE)
++set (CMAKE_C_FLAGS_RELEASE   "-O2 -DNDEBUG"               CACHE STRING "" FORCE)
++set (CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -DDEBUG -std=c++11"  CACHE STRING "" FORCE)
++set (CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG -std=c++11"    CACHE STRING "" FORCE)
++
++# Device (NVCC) flags
++#   Debug   : -G -g -O0  → in-kernel cuda-gdb breakpoints
++#   Release : -lineinfo -O3 → profiling line-info only
++if (CMAKE_BUILD_TYPE STREQUAL "Debug")
++    set (CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};-G;-g;-O0;-D__CUDA__;-D__CUDACC__;-std=c++11;${GPU_ARCHS}")
++else ()
++    set (CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS};-lineinfo;-O3;-D__CUDA__;-D__CUDACC__;-std=c++11;${GPU_ARCHS}")
++endif ()
+ set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
+
+ if (no_cc)

@@ -94,6 +94,8 @@ static int fio_plink_init(struct thread_data *td)
 	struct plink_data *pd;
 	int ret;
 
+	log_info("parallelink: build=%s\n", PLINK_BUILD_TYPE);
+
 	pd = calloc(1, sizeof(*pd));
 	if (!pd)
 		return -ENOMEM;
