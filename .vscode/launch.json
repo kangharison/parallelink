@@ -5,9 +5,9 @@
             "name": "parallelink: CUDA + C/C++ (cuda-gdb)",
             "type": "cuda-gdb",
             "request": "launch",
-            "program": "${workspaceFolder}/dist/fio",
+            "program": "${workspaceFolder}/extern/fio/fio",
             "args": [
-                "--ioengine=external:parallelink.so",
+                "--ioengine=external:${workspaceFolder}/build/parallelink.so",
                 "--name=gpu-randread",
                 "--rw=randread",
                 "--bs=4k",
@@ -18,10 +18,10 @@
                 "--n_queues=2",
                 "--nvme_dev=/dev/libnvm0"
             ],
-            "cwd": "${workspaceFolder}/dist",
+            "cwd": "${workspaceFolder}",
             "environment": [
-                { "name": "FIO_EXT_ENG_DIR", "value": "${workspaceFolder}/dist" },
-                { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/dist" }
+                { "name": "FIO_EXT_ENG_DIR", "value": "${workspaceFolder}/build" },
+                { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/extern/bam/build/lib" }
             ],
             "debuggerPath": "/usr/local/cuda/bin/cuda-gdb",
             "stopAtEntry": false,
@@ -31,9 +31,9 @@
             "name": "parallelink: host only (gdb)",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/dist/fio",
+            "program": "${workspaceFolder}/extern/fio/fio",
             "args": [
-                "--ioengine=external:parallelink.so",
+                "--ioengine=external:${workspaceFolder}/build/parallelink.so",
                 "--name=gpu-randread",
                 "--rw=randread",
                 "--bs=4k",
@@ -44,10 +44,10 @@
                 "--n_queues=2",
                 "--nvme_dev=/dev/libnvm0"
             ],
-            "cwd": "${workspaceFolder}/dist",
+            "cwd": "${workspaceFolder}",
             "environment": [
-                { "name": "FIO_EXT_ENG_DIR", "value": "${workspaceFolder}/dist" },
-                { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/dist" }
+                { "name": "FIO_EXT_ENG_DIR", "value": "${workspaceFolder}/build" },
+                { "name": "LD_LIBRARY_PATH", "value": "${workspaceFolder}/extern/bam/build/lib" }
             ],
             "MIMode": "gdb",
             "stopAtEntry": false,
