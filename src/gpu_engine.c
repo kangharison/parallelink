@@ -109,6 +109,18 @@ static int fio_plink_init(struct thread_data *td)
 
 	log_info("parallelink: build=%s\n", PLINK_BUILD_TYPE);
 
+	/*
+	 * Diskless engine: register a dummy file so fio's get_next_file()
+	 * has something to hand back in io_u->file. Without this the I/O
+	 * loop hits NULL and bails out of get_io_u() immediately.
+	 */
+	if (!td->files_index) {
+		add_file(td, td->o.filename ? td->o.filename : "parallelink",
+			 0, 1);
+		if (!td->o.nr_files)
+			td->o.nr_files = 1;
+	}
+
 	pd = calloc(1, sizeof(*pd));
 	if (!pd)
 		return -ENOMEM;
@@ -286,7 +298,7 @@ static int fio_plink_close_file(struct thread_data *td, struct fio_file *f)
 struct ioengine_ops ioengine = {
 	.name               = "parallelink",
 	.version            = FIO_IOOPS_VERSION,
-	.flags              = FIO_NOEXTEND | FIO_NODISKUTIL,
+	.flags              = FIO_NOEXTEND | FIO_NODISKUTIL | FIO_DISKLESSIO,
 	.init               = fio_plink_init,
 	.queue              = fio_plink_queue,
 	.commit             = fio_plink_commit,
