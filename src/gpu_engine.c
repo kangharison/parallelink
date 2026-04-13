@@ -32,6 +32,19 @@ struct plink_options {
 struct plink_data {
 	struct plink_shared_state *state;
 	uint64_t last_seen;   /* last polled done_count */
+
+	/*
+	 * io_u ring. The GPU engine doesn't actually use io_u's for I/O —
+	 * the GPU autonomously issues commands. io_u's are kept here purely
+	 * as accounting tokens so that fio's completion path
+	 * (io_completed → td->bytes_done) runs and keep_running() doesn't
+	 * terminate the job for "no progress".
+	 */
+	struct io_u **queued;
+	unsigned int  ring_size;
+	unsigned int  head;
+	unsigned int  tail;
+	unsigned int  nr;
 };
 
 /* ------------------------------------------------------------------ */
@@ -100,11 +113,19 @@ static int fio_plink_init(struct thread_data *td)
 	if (!pd)
 		return -ENOMEM;
 
+	pd->ring_size = td->o.iodepth ? td->o.iodepth : 1;
+	pd->queued = calloc(pd->ring_size, sizeof(*pd->queued));
+	if (!pd->queued) {
+		free(pd);
+		return -ENOMEM;
+	}
+
 	ret = plink_gpu_init(&pd->state, o->gpu_id, o->nvme_dev,
 			     o->n_queues, td->o.iodepth);
 	if (ret) {
 		log_err("parallelink: GPU init failed (ret=%d). "
 			"Is libnvm loaded? (insmod libnvm.ko)\n", ret);
+		free(pd->queued);
 		free(pd);
 		return ret;
 	}
@@ -131,6 +152,7 @@ static int fio_plink_init(struct thread_data *td)
 	if (ret) {
 		log_err("parallelink: GPU kernel launch failed\n");
 		plink_gpu_shutdown(pd->state);
+		free(pd->queued);
 		free(pd);
 		return ret;
 	}
@@ -140,13 +162,22 @@ static int fio_plink_init(struct thread_data *td)
 }
 
 /*
- * queue() is a no-op: the GPU kernel autonomously generates and
- * submits I/O. fio calls this per io_u, but the real work happens
- * on the GPU side.
+ * queue(): the GPU kernel autonomously generates and submits I/O, so
+ * the io_u carries no real payload. We stash it in a ring so that
+ * event() can hand it back to fio later for completion accounting.
  */
 static enum fio_q_status fio_plink_queue(struct thread_data *td,
 					 struct io_u *io_u)
 {
+	struct plink_data *pd = td->io_ops_data;
+
+	if (pd->nr >= pd->ring_size)
+		return FIO_Q_BUSY;
+
+	pd->queued[pd->head] = io_u;
+	pd->head = (pd->head + 1) % pd->ring_size;
+	pd->nr++;
+
 	return FIO_Q_QUEUED;
 }
 
@@ -165,28 +196,54 @@ static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 			       unsigned int max, const struct timespec *t)
 {
 	struct plink_data *pd = td->io_ops_data;
-	int events = 0;
+	unsigned int events = 0;
 
-	while (events < (int)min) {
+	/*
+	 * Clamp by ring occupancy: we can only "complete" as many io_u's
+	 * back to fio as we currently have queued, regardless of how many
+	 * I/Os the GPU has actually finished.
+	 */
+	if (max > pd->nr)
+		max = pd->nr;
+	if (min > max)
+		min = max;
+
+	while (events < min) {
 		uint64_t gpu_done = __atomic_load_n(
 			&pd->state->done_count, __ATOMIC_ACQUIRE);
 		uint64_t new_events = gpu_done - pd->last_seen;
 
 		if (new_events > 0) {
-			events = (new_events > max) ? max : (int)new_events;
-			pd->last_seen += events;
+			if (new_events > max)
+				new_events = max;
+			pd->last_seen += new_events;
+			events = (unsigned int)new_events;
 			break;
 		}
 		usleep(1);
 	}
 
-	return events;
+	return (int)events;
 }
 
 static struct io_u *fio_plink_event(struct thread_data *td, int event)
 {
-	/* Return a generic io_u — real I/O was done on GPU */
-	return NULL;
+	struct plink_data *pd = td->io_ops_data;
+	struct io_u *io_u;
+
+	(void)event;
+
+	if (!pd->nr)
+		return NULL;
+
+	io_u = pd->queued[pd->tail];
+	pd->queued[pd->tail] = NULL;
+	pd->tail = (pd->tail + 1) % pd->ring_size;
+	pd->nr--;
+
+	io_u->error = 0;
+	io_u->resid = 0;
+	return io_u;
 }
 
 static void fio_plink_cleanup(struct thread_data *td)
@@ -195,6 +252,7 @@ static void fio_plink_cleanup(struct thread_data *td)
 
 	if (pd) {
 		plink_gpu_shutdown(pd->state);
+		free(pd->queued);
 		free(pd);
 		td->io_ops_data = NULL;
 	}
@@ -228,8 +286,7 @@ static int fio_plink_close_file(struct thread_data *td, struct fio_file *f)
 struct ioengine_ops ioengine = {
 	.name               = "parallelink",
 	.version            = FIO_IOOPS_VERSION,
-	.flags              = FIO_NOEXTEND | FIO_NODISKUTIL |
-			      FIO_ASYNCIO_SETS_ISSUE_TIME,
+	.flags              = FIO_NOEXTEND | FIO_NODISKUTIL,
 	.init               = fio_plink_init,
 	.queue              = fio_plink_queue,
 	.commit             = fio_plink_commit,
