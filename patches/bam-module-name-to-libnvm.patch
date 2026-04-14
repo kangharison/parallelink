@@ -1,0 +1,13 @@
+diff --git a/module/pci.c b/module/pci.c
+index c19f1f5..c326ff8 100644
+--- a/module/pci.c
++++ b/module/pci.c
+@@ -16,7 +16,7 @@
+ #include <asm/errno.h>
+ #include <asm/page.h>
+ 
+-#define DRIVER_NAME         "libnvm helper"
++#define DRIVER_NAME         "libnvm"
+ #define PCI_CLASS_NVME      0x010802
+ #define PCI_CLASS_NVME_MASK 0xffffff
+ 
