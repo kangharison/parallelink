@@ -58,7 +58,7 @@ __global__ void plink_io_worker(struct plink_shared_state *state,
 				page_cache_d_t *pc,
 				int n_queues)
 {
-	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
 	if (tid >= state->total_threads)
 		return;
 
@@ -71,31 +71,30 @@ __global__ void plink_io_worker(struct plink_shared_state *state,
 	/* I/O granularity in LBAs. n_blocks is in 512B LBAs from the host side
 	 * but BaM read_data/write_data expect it in device block units.  */
 	uint32_t lba_shift = qp->block_size_log;
-	uint64_t n_blocks_dev = ((uint64_t)state->n_blocks * 512ULL) >> lba_shift;
+	uint64_t n_blocks_dev = ((uint64_t)state->n_blocks * state->block_size) >> lba_shift;
 	if (n_blocks_dev == 0)
 		n_blocks_dev = 1;
 
 	uint64_t lba_max = state->lba_range; /* in 512B LBAs */
 
 	uint64_t ios_done = 0;
-	uint64_t seed = (uint64_t)tid * 6364136223846793005ULL + 1;
+	uint64_t seed = tid * 6364136223846793005ULL + 1;
 
-	while (!state->shutdown && ios_done < state->ios_per_thread) {
+	while (!state->shutdown) {
 
 		/* Pick LBA in device block units */
-		uint64_t lba_512;
+		uint64_t start_block;
 		if (state->random) {
 			seed ^= seed << 13;
 			seed ^= seed >> 7;
 			seed ^= seed << 17;
-			lba_512 = seed % lba_max;
+			start_block = seed % lba_max;
 		} else {
-			lba_512 = ((uint64_t)tid * state->ios_per_thread + ios_done)
-				  * state->n_blocks;
+			start_block = (tid * state->ios_per_thread + ios_done)
+				      * state->n_blocks;
 			if (lba_max)
-				lba_512 %= lba_max;
+				start_block %= lba_max;
 		}
-		uint64_t start_block = (lba_512 * 512ULL) >> lba_shift;
 
 		uint64_t t_start = clock64();
 
