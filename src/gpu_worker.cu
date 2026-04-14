@@ -105,6 +105,8 @@ __global__ void plink_io_worker(struct plink_shared_state *state,
 
 		uint64_t t_end = clock64();
 
+		__syncwarp();
+
 		if (state->record_lat && state->latencies)
 			state->latencies[tid] = t_end - t_start;
 
