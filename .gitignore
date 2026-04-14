@@ -4,3 +4,4 @@ extern/bam/build/
 extern/fio/fio
 *.o
 CLAUDE.md
+.vscode
