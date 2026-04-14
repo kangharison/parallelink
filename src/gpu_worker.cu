@@ -3,8 +3,33 @@
  *
  * Initializes libnvm (BaM) controller, allocates a GPU-resident page cache
  * (data buffers + PRP lists) and launches a persistent CUDA kernel that
- * submits/completes NVMe I/O directly from the GPU. CPU only polls
- * done_count for fio statistics.
+ * submits/completes NVMe I/O directly from the GPU. CPU only polls a
+ * mirrored done counter for fio statistics.
+ *
+ * Memory layout (post-P0 refactor — no managed memory on the hot path):
+ *
+ *   - Workload parameters (`struct plink_workload`) are passed BY VALUE as
+ *     a kernel launch argument → parameter buffer → registers. Every field
+ *     the I/O loop reads (opcode, ios_per_thread, n_blocks, lba_range,
+ *     random, record_lat, latencies*) is in-register; zero memory traffic
+ *     for workload config during the loop.
+ *
+ *   - The done counter (`d_done_count`) is pure device memory
+ *     (`cudaMalloc`). The GPU atomicAdds to it at full device-memory
+ *     speed. The CPU never touches this pointer directly; it pulls a
+ *     mirror via `cudaMemcpyAsync` on a side stream (plink_gpu_poll_done).
+ *
+ *   - The CPU→GPU shutdown signal lives in a pinned+mapped host
+ *     allocation (`cudaHostAlloc(cudaHostAllocMapped)`). The CPU writes
+ *     `h_ctrl->shutdown = 1` as a plain host store; the GPU reads
+ *     `d_ctrl->shutdown` which maps to the same physical page via PCIe —
+ *     no migration, no page-fault storm.
+ *
+ * This replaces the previous cudaMallocManaged `plink_shared_state` which
+ * placed hot workload fields and the done counter on the same unified
+ * page as the shutdown flag, causing a page-migration ping-pong between
+ * the CPU poller and the GPU kernel that slowed throughput to a crawl
+ * and could hang the kernel entirely on non-ATS systems.
  */
 
 #include <cuda_runtime.h>
@@ -33,7 +58,15 @@ struct plink_gpu_ctx {
 	page_cache_t    *pc;
 	page_cache_d_t  *d_pc;
 	Controller     **d_ctrls;
-	cudaStream_t     stream;
+
+	cudaStream_t     compute_stream;  /* runs the persistent kernel */
+	cudaStream_t     copy_stream;     /* D2H done-counter mirror */
+
+	struct plink_ctrl_block *h_ctrl;  /* pinned mapped, host view */
+	struct plink_ctrl_block *d_ctrl;  /* device ptr into the same pinned page */
+
+	uint64_t        *d_done_count;    /* pure device memory */
+
 	int              n_queues;
 	int              gpu_warps;
 	int              total_threads;
@@ -52,14 +85,25 @@ static plink_gpu_ctx g_ctx = {};
  * ios_per_thread NVMe commands via BaM's read_data/write_data device
  * helpers. Those helpers internally build the command, set PRPs from
  * pc->prp1/prp2, do sq_enqueue + cq_poll + cq_dequeue, and release cid.
+ *
+ * Launch bounds target the same SM-level occupancy as BaM's block
+ * benchmark (2048 resident threads/SM) but with a 128-thread block
+ * shape: 128 × 16 = 2048. The absolute occupancy target matters more
+ * than block shape here because BaM's queue primitives spin on
+ * device-wide atomics with __nanosleep backoff — the more warps
+ * resident per SM, the better the SM can hide that latency. 128 also
+ * lines up cleanly with the (tid/32) % n_queues warp-to-queue mapping.
  */
-__global__ void plink_io_worker(struct plink_shared_state *state,
-				Controller **ctrls,
-				page_cache_d_t *pc,
-				int n_queues)
+__global__ __launch_bounds__(128, 16)
+void plink_io_worker(struct plink_ctrl_block *ctrl,
+		     uint64_t *d_done_count,
+		     struct plink_workload wl,
+		     Controller **ctrls,
+		     page_cache_d_t *pc,
+		     int n_queues)
 {
 	uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-	if (tid >= state->total_threads)
+	if (tid >= (uint64_t)wl.total_threads)
 		return;
 
 	int q_idx = (tid / 32) % n_queues;
@@ -68,49 +112,65 @@ __global__ void plink_io_worker(struct plink_shared_state *state,
 	/* Each thread owns one distinct page-cache slot for its in-flight I/O. */
 	uint64_t pc_entry = (uint64_t)tid % pc->n_pages;
 
-	/* I/O granularity in LBAs. n_blocks is in 512B LBAs from the host side
-	 * but BaM read_data/write_data expect it in device block units.  */
+	/* I/O granularity in LBAs. wl.n_blocks is in 512B LBAs from the host side
+	 * but BaM read_data/write_data expect it in device block units. */
 	uint32_t lba_shift = qp->block_size_log;
-	uint64_t n_blocks_dev = ((uint64_t)state->n_blocks * state->block_size) >> lba_shift;
+	uint64_t n_blocks_dev = ((uint64_t)wl.n_blocks * 512ULL) >> lba_shift;
 	if (n_blocks_dev == 0)
 		n_blocks_dev = 1;
 
-	uint64_t lba_max = state->lba_range; /* in 512B LBAs */
+	uint64_t lba_max = wl.lba_range;
 
 	uint64_t ios_done = 0;
 	uint64_t seed = tid * 6364136223846793005ULL + 1;
 
-	while (!state->shutdown) {
+	/*
+	 * The kernel runs until the CPU signals shutdown. fio's keep_running()
+	 * decides when the job ends and then plink_gpu_shutdown() writes the
+	 * pinned ctrl flag. Each shutdown read is a PCIe round-trip to host
+	 * memory, so we amortize by polling once every 64 I/Os — at BaM I/O
+	 * rates the added latency is well under 10ns/iter.
+	 */
+	while (true) {
+		if ((ios_done & 63) == 0) {
+			if (ctrl->shutdown)
+				break;
+		}
 
-		/* Pick LBA in device block units */
-		uint64_t start_block;
-		if (state->random) {
+		uint64_t lba_512;
+		if (wl.random) {
 			seed ^= seed << 13;
 			seed ^= seed >> 7;
 			seed ^= seed << 17;
-			start_block = seed % lba_max;
+			lba_512 = seed % lba_max;
 		} else {
-			start_block = (tid * state->ios_per_thread + ios_done)
-				      * state->n_blocks;
+			lba_512 = (tid * wl.ios_per_thread + ios_done)
+				  * wl.n_blocks;
 			if (lba_max)
-				start_block %= lba_max;
+				lba_512 %= lba_max;
 		}
+		uint64_t start_block = (lba_512 * 512ULL) >> lba_shift;
 
 		uint64_t t_start = clock64();
 
-		if (state->opcode == PLINK_OP_READ)
+		if (wl.opcode == PLINK_OP_READ)
 			read_data(pc, qp, start_block, n_blocks_dev, pc_entry);
 		else
 			write_data(pc, qp, start_block, n_blocks_dev, pc_entry);
 
 		uint64_t t_end = clock64();
 
+		/*
+		 * Explicit warp reconverge. Empirically required to avoid a hang
+		 * on Volta+; kept defensively until P0 is verified to render it
+		 * unnecessary on its own.
+		 */
 		__syncwarp();
 
-		if (state->record_lat && state->latencies)
-			state->latencies[tid] = t_end - t_start;
+		if (wl.record_lat && wl.latencies)
+			wl.latencies[tid] = t_end - t_start;
 
-		atomicAdd((unsigned long long *)&state->done_count, 1ULL);
+		atomicAdd((unsigned long long *)d_done_count, 1ULL);
 		ios_done++;
 	}
 }
@@ -132,14 +192,46 @@ extern "C" int plink_gpu_init(struct plink_shared_state **state_out,
 		return -1;
 	}
 
-	/* Shared state lives in managed memory for cheap CPU polling. */
-	err = cudaMallocManaged(state_out, sizeof(struct plink_shared_state));
-	if (err != cudaSuccess) {
-		fprintf(stderr, "parallelink: cudaMallocManaged failed: %s\n",
-			cudaGetErrorString(err));
+	struct plink_shared_state *state =
+		(struct plink_shared_state *)calloc(1, sizeof(*state));
+	if (!state) {
+		fprintf(stderr, "parallelink: shared-state alloc failed\n");
 		return -1;
 	}
-	memset(*state_out, 0, sizeof(struct plink_shared_state));
+
+	/* Pinned+mapped ctrl block for CPU→GPU shutdown signalling. */
+	err = cudaHostAlloc(&g_ctx.h_ctrl, sizeof(struct plink_ctrl_block),
+			    cudaHostAllocMapped | cudaHostAllocWriteCombined);
+	if (err != cudaSuccess) {
+		fprintf(stderr, "parallelink: cudaHostAlloc(ctrl) failed: %s\n",
+			cudaGetErrorString(err));
+		free(state);
+		return -1;
+	}
+	g_ctx.h_ctrl->shutdown = 0;
+
+	err = cudaHostGetDevicePointer((void **)&g_ctx.d_ctrl, g_ctx.h_ctrl, 0);
+	if (err != cudaSuccess) {
+		fprintf(stderr, "parallelink: cudaHostGetDevicePointer failed: %s\n",
+			cudaGetErrorString(err));
+		cudaFreeHost(g_ctx.h_ctrl);
+		g_ctx.h_ctrl = nullptr;
+		free(state);
+		return -1;
+	}
+
+	/* Pure device memory for the done counter — GPU atomicAdds at
+	 * device-memory speed; CPU never touches this pointer directly. */
+	err = cudaMalloc(&g_ctx.d_done_count, sizeof(uint64_t));
+	if (err != cudaSuccess) {
+		fprintf(stderr, "parallelink: cudaMalloc(d_done_count) failed: %s\n",
+			cudaGetErrorString(err));
+		cudaFreeHost(g_ctx.h_ctrl);
+		g_ctx.h_ctrl = nullptr;
+		free(state);
+		return -1;
+	}
+	cudaMemset(g_ctx.d_done_count, 0, sizeof(uint64_t));
 
 	try {
 		/* namespace 1 is the default for most NVMe drives. */
@@ -150,8 +242,9 @@ extern "C" int plink_gpu_init(struct plink_shared_state **state_out,
 		fprintf(stderr, "parallelink: Controller init failed: %s\n"
 			"  (check that libnvm.ko is loaded and %s is bound to libnvm)\n",
 			e.what(), nvme_dev);
-		cudaFree(*state_out);
-		*state_out = nullptr;
+		cudaFree(g_ctx.d_done_count); g_ctx.d_done_count = nullptr;
+		cudaFreeHost(g_ctx.h_ctrl);   g_ctx.h_ctrl        = nullptr;
+		free(state);
 		return -1;
 	}
 
@@ -171,10 +264,10 @@ extern "C" int plink_gpu_init(struct plink_shared_state **state_out,
 	} catch (const std::exception &e) {
 		fprintf(stderr, "parallelink: page_cache_t init failed: %s\n",
 			e.what());
-		delete g_ctx.ctrl;
-		g_ctx.ctrl = nullptr;
-		cudaFree(*state_out);
-		*state_out = nullptr;
+		delete g_ctx.ctrl;            g_ctx.ctrl          = nullptr;
+		cudaFree(g_ctx.d_done_count); g_ctx.d_done_count  = nullptr;
+		cudaFreeHost(g_ctx.h_ctrl);   g_ctx.h_ctrl        = nullptr;
+		free(state);
 		return -1;
 	}
 
@@ -182,30 +275,56 @@ extern "C" int plink_gpu_init(struct plink_shared_state **state_out,
 	g_ctx.d_ctrls  = g_ctx.pc->pdt.d_ctrls;
 	g_ctx.n_queues = n_queues;
 
-	err = cudaStreamCreateWithFlags(&g_ctx.stream, cudaStreamNonBlocking);
+	err = cudaStreamCreateWithFlags(&g_ctx.compute_stream,
+					cudaStreamNonBlocking);
 	if (err != cudaSuccess) {
-		fprintf(stderr, "parallelink: cudaStreamCreate failed: %s\n",
+		fprintf(stderr, "parallelink: cudaStreamCreate(compute) failed: %s\n",
 			cudaGetErrorString(err));
-		delete g_ctx.pc;   g_ctx.pc   = nullptr;
-		delete g_ctx.ctrl; g_ctx.ctrl = nullptr;
-		cudaFree(*state_out);
-		*state_out = nullptr;
-		return -1;
+		goto fail_streams;
+	}
+	err = cudaStreamCreateWithFlags(&g_ctx.copy_stream,
+					cudaStreamNonBlocking);
+	if (err != cudaSuccess) {
+		fprintf(stderr, "parallelink: cudaStreamCreate(copy) failed: %s\n",
+			cudaGetErrorString(err));
+		cudaStreamDestroy(g_ctx.compute_stream);
+		g_ctx.compute_stream = 0;
+		goto fail_streams;
 	}
 
+	state->h_ctrl      = g_ctx.h_ctrl;
+	state->done_mirror = 0;
+	*state_out         = state;
 	return 0;
+
+fail_streams:
+	delete g_ctx.pc;              g_ctx.pc            = nullptr;
+	delete g_ctx.ctrl;            g_ctx.ctrl          = nullptr;
+	cudaFree(g_ctx.d_done_count); g_ctx.d_done_count  = nullptr;
+	cudaFreeHost(g_ctx.h_ctrl);   g_ctx.h_ctrl        = nullptr;
+	free(state);
+	return -1;
 }
 
 extern "C" int plink_gpu_launch(struct plink_shared_state *state,
+				const struct plink_workload *wl_in,
 				int gpu_warps, int n_queues)
 {
+	(void)state;
+
 	g_ctx.gpu_warps     = gpu_warps;
 	g_ctx.total_threads = gpu_warps * 32;
 
-	/* Allocate per-thread latency buffer if requested. */
-	if (state->record_lat && !state->latencies) {
-		cudaError_t err = cudaMallocManaged(
-			&state->latencies,
+	/* Make a local, mutable copy so we can fix up latencies* if needed. */
+	struct plink_workload wl = *wl_in;
+	wl.total_threads = g_ctx.total_threads;
+
+	/* Allocate per-thread latency buffer in pure device memory if
+	 * requested. Previously this was cudaMallocManaged, which reintroduced
+	 * the same unified-memory thrash we just eliminated for shared state. */
+	if (wl.record_lat && !wl.latencies) {
+		uint64_t *d_lat = nullptr;
+		cudaError_t err = cudaMalloc(&d_lat,
 			sizeof(uint64_t) * g_ctx.total_threads);
 		if (err != cudaSuccess) {
 			fprintf(stderr,
@@ -213,14 +332,18 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 				cudaGetErrorString(err));
 			return -1;
 		}
+		cudaMemset(d_lat, 0,
+			sizeof(uint64_t) * g_ctx.total_threads);
+		wl.latencies = d_lat;
 	}
 
-	int threads_per_block = 128;
+	const int threads_per_block = 128;
 	int blocks = (g_ctx.total_threads + threads_per_block - 1)
 		     / threads_per_block;
 
-	plink_io_worker<<<blocks, threads_per_block, 0, g_ctx.stream>>>(
-		state, g_ctx.d_ctrls, g_ctx.d_pc, n_queues);
+	plink_io_worker<<<blocks, threads_per_block, 0, g_ctx.compute_stream>>>(
+		g_ctx.d_ctrl, g_ctx.d_done_count, wl,
+		g_ctx.d_ctrls, g_ctx.d_pc, n_queues);
 
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) {
@@ -232,18 +355,45 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 	return 0;
 }
 
+extern "C" int plink_gpu_poll_done(struct plink_shared_state *state)
+{
+	if (!state || !g_ctx.d_done_count)
+		return -1;
+
+	uint64_t mirror = 0;
+	cudaError_t err = cudaMemcpyAsync(&mirror, g_ctx.d_done_count,
+					  sizeof(uint64_t),
+					  cudaMemcpyDeviceToHost,
+					  g_ctx.copy_stream);
+	if (err != cudaSuccess)
+		return -1;
+
+	err = cudaStreamSynchronize(g_ctx.copy_stream);
+	if (err != cudaSuccess)
+		return -1;
+
+	state->done_mirror = mirror;
+	return 0;
+}
+
 extern "C" void plink_gpu_shutdown(struct plink_shared_state *state)
 {
 	if (!state)
 		return;
 
-	state->shutdown = 1;
-	__sync_synchronize();
+	/* Signal the kernel to stop. Single host store to pinned memory;
+	 * the GPU picks it up on its next periodic check. */
+	if (g_ctx.h_ctrl)
+		g_ctx.h_ctrl->shutdown = 1;
 
-	if (g_ctx.stream) {
-		cudaStreamSynchronize(g_ctx.stream);
-		cudaStreamDestroy(g_ctx.stream);
-		g_ctx.stream = 0;
+	if (g_ctx.compute_stream) {
+		cudaStreamSynchronize(g_ctx.compute_stream);
+		cudaStreamDestroy(g_ctx.compute_stream);
+		g_ctx.compute_stream = 0;
+	}
+	if (g_ctx.copy_stream) {
+		cudaStreamDestroy(g_ctx.copy_stream);
+		g_ctx.copy_stream = 0;
 	}
 
 	if (g_ctx.pc) {
@@ -255,9 +405,15 @@ extern "C" void plink_gpu_shutdown(struct plink_shared_state *state)
 		g_ctx.ctrl = nullptr;
 	}
 
-	if (state->latencies) {
-		cudaFree(state->latencies);
-		state->latencies = nullptr;
+	if (g_ctx.d_done_count) {
+		cudaFree(g_ctx.d_done_count);
+		g_ctx.d_done_count = nullptr;
 	}
-	cudaFree(state);
+	if (g_ctx.h_ctrl) {
+		cudaFreeHost(g_ctx.h_ctrl);
+		g_ctx.h_ctrl = nullptr;
+		g_ctx.d_ctrl = nullptr;
+	}
+
+	free(state);
 }

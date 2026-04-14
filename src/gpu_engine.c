@@ -31,7 +31,8 @@ struct plink_options {
 
 struct plink_data {
 	struct plink_shared_state *state;
-	uint64_t last_seen;   /* last polled done_count */
+	struct plink_workload      wl;
+	uint64_t last_seen;   /* last polled done counter */
 
 	/*
 	 * io_u ring. The GPU engine doesn't actually use io_u's for I/O —
@@ -142,25 +143,30 @@ static int fio_plink_init(struct thread_data *td)
 		return ret;
 	}
 
-	/* Configure workload parameters for GPU kernel */
-	pd->state->block_size   = td->o.bs[DDIR_READ];
-	pd->state->n_blocks     = td->o.bs[DDIR_READ] / 512;
-	pd->state->opcode       = td_read(td) ? PLINK_OP_READ : PLINK_OP_WRITE;
-	pd->state->random       = td_random(td);
-	pd->state->lba_range    = td->o.size / 512;
-	pd->state->done_count   = 0;
-	pd->state->shutdown     = 0;
-	pd->last_seen           = 0;
+	/*
+	 * Workload parameters are now passed as kernel launch arguments
+	 * (→ register/constant memory on the GPU) rather than dropped
+	 * into a cudaMallocManaged struct the CPU keeps touching. Filling
+	 * pd->wl here is purely a host-side setup; it is copied by value
+	 * into the kernel call in plink_gpu_launch().
+	 */
+	pd->wl.block_size   = td->o.bs[DDIR_READ];
+	pd->wl.n_blocks     = td->o.bs[DDIR_READ] / 512;
+	pd->wl.opcode       = td_read(td) ? PLINK_OP_READ : PLINK_OP_WRITE;
+	pd->wl.random       = td_random(td);
+	pd->wl.lba_range    = td->o.size / 512;
+	pd->wl.record_lat   = 0;
+	pd->wl.latencies    = NULL;
+	pd->last_seen       = 0;
 
-	/* Calculate per-thread I/O count */
 	int total_threads       = o->gpu_warps * 32;
 	uint64_t total_ios      = td->o.size / td->o.bs[DDIR_READ];
 
-	pd->state->total_threads  = total_threads;
-	pd->state->ios_per_thread = total_ios / total_threads;
+	pd->wl.total_threads  = total_threads;
+	pd->wl.ios_per_thread = total_threads ? (total_ios / total_threads) : 0;
 
 	/* Launch persistent GPU kernel */
-	ret = plink_gpu_launch(pd->state, o->gpu_warps, o->n_queues);
+	ret = plink_gpu_launch(pd->state, &pd->wl, o->gpu_warps, o->n_queues);
 	if (ret) {
 		log_err("parallelink: GPU kernel launch failed\n");
 		plink_gpu_shutdown(pd->state);
@@ -221,8 +227,16 @@ static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 		min = max;
 
 	while (events < min) {
-		uint64_t gpu_done = __atomic_load_n(
-			&pd->state->done_count, __ATOMIC_ACQUIRE);
+		/*
+		 * Pull a fresh mirror of the device-side done counter via a
+		 * side stream. The kernel itself runs on a different stream
+		 * and is unaffected. This replaces the previous managed-
+		 * memory poll, which thrashed unified pages with the GPU.
+		 */
+		if (plink_gpu_poll_done(pd->state))
+			break;
+
+		uint64_t gpu_done = pd->state->done_mirror;
 		uint64_t new_events = gpu_done - pd->last_seen;
 
 		if (new_events > 0) {
@@ -232,7 +246,9 @@ static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 			events = (unsigned int)new_events;
 			break;
 		}
-		usleep(1);
+		/* 100 µs backoff — fio stats resolution is ms, so this is
+		 * plenty, and it keeps CPU-side pressure off the side stream. */
+		usleep(100);
 	}
 
 	return (int)events;
