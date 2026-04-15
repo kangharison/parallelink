@@ -120,6 +120,29 @@ target_include_directories(bam-admin-cli PRIVATE
 target_compile_definitions(bam-admin-cli PRIVATE _GNU_SOURCE)
 
 # -------------------------------------------------------------------
+#  plink_hook: client side of the admin socket linked into libnvme
+#
+#  A tiny PIC static library containing plink_ioctl_hook(), the
+#  function that libnvme's nvme_submit_passthru() is patched to
+#  call instead of ioctl(2) when libnvme is built with -DPLINK.
+#  The library is linked into libnvme.so at libnvme build time
+#  (see build.sh), not at CMake time — this target only builds it.
+# -------------------------------------------------------------------
+add_library(plink_hook STATIC
+    src/plink_ioctl_hook.c
+)
+
+target_include_directories(plink_hook PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_compile_definitions(plink_hook PRIVATE _GNU_SOURCE)
+
+set_target_properties(plink_hook PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# -------------------------------------------------------------------
 #  Holder daemon (keeps GPU memory alive across fio runs)
 # -------------------------------------------------------------------
 add_executable(plink-holder
