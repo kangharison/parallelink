@@ -19,6 +19,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIO_DIR="${ROOT}/extern/fio"
 BAM_DIR="${ROOT}/extern/bam"
 BAM_BUILD="${BAM_DIR}/build"
+LIBNVME_DIR="${ROOT}/extern/libnvme"
+NVME_CLI_DIR="${ROOT}/extern/nvme-cli"
 PLINK_BUILD="${ROOT}/build"
 DIST="${ROOT}/dist"
 
@@ -93,8 +95,16 @@ done
 
 # ------------------------------------------------------------------
 # 0. Submodules
+#
+# libnvme / nvme-cli are checked out here but not yet built — the
+# PLINK ioctl hook wiring (libnvme patch + meson build) lands in a
+# later commit. For now we just make sure the trees exist so the
+# upcoming build steps can assume them.
 # ------------------------------------------------------------------
-if [[ ! -f "${FIO_DIR}/Makefile" ]] || [[ ! -f "${BAM_DIR}/CMakeLists.txt" ]]; then
+if [[ ! -f "${FIO_DIR}/Makefile" ]] \
+   || [[ ! -f "${BAM_DIR}/CMakeLists.txt" ]] \
+   || [[ ! -f "${LIBNVME_DIR}/meson.build" ]] \
+   || [[ ! -f "${NVME_CLI_DIR}/meson.build" ]]; then
     echo "==> [0/4] git submodule update --init --recursive"
     git -C "${ROOT}" submodule update --init --recursive
 fi
