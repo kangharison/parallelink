@@ -94,6 +94,22 @@ for BAM_PATCH in "${ROOT}"/patches/bam-*.patch; do
 done
 
 # ------------------------------------------------------------------
+# Apply libnvme patches (idempotent) — currently just the PLINK
+# ioctl hook that redirects admin passthru through the parallelink
+# admin socket.
+# ------------------------------------------------------------------
+for LIBNVME_PATCH in "${ROOT}"/patches/libnvme-*.patch; do
+    if [[ -f "${LIBNVME_PATCH}" ]]; then
+        if git -C "${LIBNVME_DIR}" apply --reverse --check "${LIBNVME_PATCH}" >/dev/null 2>&1; then
+            echo "==> ${LIBNVME_PATCH} already applied"
+        else
+            echo "==> Applying ${LIBNVME_PATCH}"
+            git -C "${LIBNVME_DIR}" apply "${LIBNVME_PATCH}"
+        fi
+    fi
+done
+
+# ------------------------------------------------------------------
 # 0. Submodules
 #
 # libnvme / nvme-cli are checked out here but not yet built — the
@@ -105,14 +121,14 @@ if [[ ! -f "${FIO_DIR}/Makefile" ]] \
    || [[ ! -f "${BAM_DIR}/CMakeLists.txt" ]] \
    || [[ ! -f "${LIBNVME_DIR}/meson.build" ]] \
    || [[ ! -f "${NVME_CLI_DIR}/meson.build" ]]; then
-    echo "==> [0/4] git submodule update --init --recursive"
+    echo "==> [0/6] git submodule update --init --recursive"
     git -C "${ROOT}" submodule update --init --recursive
 fi
 
 # ------------------------------------------------------------------
 # 1. fio
 # ------------------------------------------------------------------
-echo "==> [1/4] Build fio"
+echo "==> [1/6] Build fio"
 pushd "${FIO_DIR}" >/dev/null
 if [[ ! -f config-host.h ]]; then
     ./configure
@@ -123,7 +139,7 @@ popd >/dev/null
 # ------------------------------------------------------------------
 # 2. libnvm (userspace lib + kernel module)
 # ------------------------------------------------------------------
-echo "==> [2/4] Build libnvm (BaM) userspace + kernel module"
+echo "==> [2/6] Build libnvm (BaM) userspace + kernel module"
 mkdir -p "${BAM_BUILD}"
 pushd "${BAM_BUILD}" >/dev/null
 CACHED_TYPE="$(grep -E '^CMAKE_BUILD_TYPE' CMakeCache.txt 2>/dev/null | cut -d= -f2 || true)"
@@ -163,9 +179,9 @@ if [[ ! -f "${BAM_BUILD}/lib/libnvm.so" ]]; then
 fi
 
 # ------------------------------------------------------------------
-# 3. parallelink
+# 3. parallelink (also produces libplink_hook.a for libnvme)
 # ------------------------------------------------------------------
-echo "==> [3/4] Build parallelink"
+echo "==> [3/6] Build parallelink"
 mkdir -p "${PLINK_BUILD}"
 pushd "${PLINK_BUILD}" >/dev/null
 CACHED_TYPE="$(grep -E '^CMAKE_BUILD_TYPE' CMakeCache.txt 2>/dev/null | cut -d= -f2 || true)"
@@ -183,10 +199,86 @@ fi
 make -j"${JOBS}"
 popd >/dev/null
 
+PLINK_HOOK_LIB="${PLINK_BUILD}/libplink_hook.a"
+if [[ ! -f "${PLINK_HOOK_LIB}" ]]; then
+    echo "ERROR: ${PLINK_HOOK_LIB} was not produced by parallelink build." >&2
+    exit 1
+fi
+
 # ------------------------------------------------------------------
-# 4. Collect artifacts into dist/
+# 4. libnvme (with PLINK admin ioctl hook)
+#
+# Meson build. We inject:
+#   -DPLINK           into c_args so src/nvme/ioctl.c compiles the
+#                     call-site that goes through plink_ioctl_hook()
+#   libplink_hook.a   into c_link_args so libnvme.so resolves the
+#                     plink_ioctl_hook symbol at link time
 # ------------------------------------------------------------------
-echo "==> [4/4] Collect artifacts → ${DIST}"
+echo "==> [4/6] Build libnvme with PLINK ioctl hook"
+LIBNVME_BUILD="${LIBNVME_DIR}/build"
+LIBNVME_BUILDTYPE="$(echo "${BUILD_TYPE}" | tr '[:upper:]' '[:lower:]')"
+
+LIBNVME_MESON_ARGS=(
+    -Dc_args="-DPLINK"
+    -Dc_link_args="${PLINK_HOOK_LIB}"
+    -Dbuildtype="${LIBNVME_BUILDTYPE}"
+    -Dpython=disabled
+    -Dopenssl=disabled
+    -Dlibdbus=disabled
+    -Dkeyutils=disabled
+    -Djson-c=disabled
+    -Ddocs=false
+    -Dtests=false
+)
+
+if [[ ! -f "${LIBNVME_BUILD}/build.ninja" ]]; then
+    meson setup "${LIBNVME_BUILD}" "${LIBNVME_DIR}" "${LIBNVME_MESON_ARGS[@]}"
+else
+    meson configure "${LIBNVME_BUILD}" "${LIBNVME_MESON_ARGS[@]}"
+fi
+ninja -C "${LIBNVME_BUILD}" -j"${JOBS}"
+
+# ------------------------------------------------------------------
+# 5. nvme-cli (linked against the PLINK-hooked libnvme)
+#
+# nvme-cli discovers libnvme via pkg-config. Point PKG_CONFIG_PATH
+# at libnvme's meson uninstalled pkgconfig dir so it prefers our
+# build over any system-installed libnvme. Also set RPATH so the
+# bundled nvme binary finds libnvme.so from dist/ at runtime.
+# ------------------------------------------------------------------
+echo "==> [5/6] Build nvme-cli"
+NVME_CLI_BUILD="${NVME_CLI_DIR}/build"
+
+LIBNVME_PC_DIR="${LIBNVME_BUILD}/meson-uninstalled"
+if [[ ! -d "${LIBNVME_PC_DIR}" ]]; then
+    echo "ERROR: ${LIBNVME_PC_DIR} not found — libnvme build incomplete?" >&2
+    exit 1
+fi
+export PKG_CONFIG_PATH="${LIBNVME_PC_DIR}:${PKG_CONFIG_PATH:-}"
+
+NVME_CLI_MESON_ARGS=(
+    -Dbuildtype="${LIBNVME_BUILDTYPE}"
+    -Dc_link_args="-Wl,-rpath,\$ORIGIN"
+    -Dpython=disabled
+    -Dopenssl=disabled
+    -Dlibdbus=disabled
+    -Dkeyutils=disabled
+    -Djson-c=disabled
+    -Ddocs=false
+    -Dtests=false
+)
+
+if [[ ! -f "${NVME_CLI_BUILD}/build.ninja" ]]; then
+    meson setup "${NVME_CLI_BUILD}" "${NVME_CLI_DIR}" "${NVME_CLI_MESON_ARGS[@]}"
+else
+    meson configure "${NVME_CLI_BUILD}" "${NVME_CLI_MESON_ARGS[@]}"
+fi
+ninja -C "${NVME_CLI_BUILD}" -j"${JOBS}"
+
+# ------------------------------------------------------------------
+# 6. Collect artifacts into dist/
+# ------------------------------------------------------------------
+echo "==> [6/6] Collect artifacts → ${DIST}"
 rm -rf "${DIST}"
 mkdir -p "${DIST}"
 
@@ -209,6 +301,21 @@ cp -f "${PLINK_BUILD}/parallelink.so" "${DIST}/parallelink.so"
 cp -f "${PLINK_BUILD}/plink-holder"   "${DIST}/plink-holder"
 cp -f "${PLINK_BUILD}/bam-admin-cli"  "${DIST}/bam-admin-cli"
 
+# PLINK-hooked libnvme + nvme-cli
+LIBNVME_SO="$(find "${LIBNVME_BUILD}" -maxdepth 2 -name 'libnvme.so*' -type f 2>/dev/null | head -n1 || true)"
+if [[ -z "${LIBNVME_SO}" || ! -f "${LIBNVME_SO}" ]]; then
+    echo "ERROR: libnvme.so not found under ${LIBNVME_BUILD}" >&2
+    exit 1
+fi
+cp -f "${LIBNVME_SO}" "${DIST}/libnvme.so"
+
+NVME_BIN="${NVME_CLI_BUILD}/nvme"
+if [[ ! -x "${NVME_BIN}" ]]; then
+    echo "ERROR: nvme-cli binary not found at ${NVME_BIN}" >&2
+    exit 1
+fi
+cp -f "${NVME_BIN}" "${DIST}/nvme"
+
 # Convenience runner: wraps fio with FIO_EXT_ENG_DIR + LD_LIBRARY_PATH
 cat > "${DIST}/run-fio.sh" <<'RUN'
 #!/usr/bin/env bash
@@ -230,4 +337,10 @@ Next steps:
   echo 0000:xx:xx.x | sudo tee /sys/bus/pci/drivers/nvme/unbind
   echo 0000:xx:xx.x | sudo tee /sys/bus/pci/drivers/libnvm/bind
   ${DIST}/run-fio.sh --ioengine=external:parallelink.so ...
+
+The bundled nvme-cli (${DIST}/nvme) links against a libnvme that
+routes NVME_IOCTL_ADMIN_CMD through the parallelink admin socket
+at ${PLINK_ADMIN_SOCK:-/tmp/nvme-admin.sock}. Run it while the fio
+engine is up, e.g.:
+  ${DIST}/nvme id-ctrl /dev/nvme0
 EOF
