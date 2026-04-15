@@ -70,17 +70,9 @@ struct plink_data {
 /* ------------------------------------------------------------------ */
 /*  Admin helper: opcode blacklist                                    */
 /* ------------------------------------------------------------------ */
-/*
- * NVMe admin command layout (all little-endian):
- *   dword[0] bits [7:0]  = opcode
- *   dword[10]            = CDW10 (for Set Features, bits [7:0] = FID)
- */
-static int plink_admin_opcode_blocked(const uint8_t *cmd)
+static int plink_admin_opcode_blocked(const struct plink_nvme_passthru_cmd *c)
 {
-	uint8_t opcode = cmd[0];    /* full 8-bit admin opcode */
-	uint32_t cdw10;
-
-	switch (opcode) {
+	switch (c->opcode) {
 	case 0x00: /* Delete I/O SQ       */
 	case 0x01: /* Create I/O SQ       */
 	case 0x04: /* Delete I/O CQ       */
@@ -90,14 +82,46 @@ static int plink_admin_opcode_blocked(const uint8_t *cmd)
 	case 0x80: /* Format NVM          */
 	case 0x84: /* Sanitize            */
 		return 1;
-	case 0x09: /* Set Features */
-		memcpy(&cdw10, cmd + 40, sizeof(cdw10));
-		if ((cdw10 & 0xff) == 0x07) /* Number of Queues */
+	case 0x09: /* Set Features: block "Number of Queues" (FID 0x07) */
+		if ((c->cdw10 & 0xff) == 0x07)
 			return 1;
 		return 0;
 	default:
 		return 0;
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/*  Build a raw NVMe SQE from a passthru cmd                          */
+/* ------------------------------------------------------------------ */
+/*
+ * plink_admin_rpc() consumes a 64-byte nvm_cmd_t. PRP1/PRP2 are
+ * overridden by the server from its pinned DMA buffer, so we only
+ * need to fill the fields that actually drive the command:
+ *   dw0  = cid(16) | psdt(2) | rsvd(4) | fuse(2) | opcode(8)
+ *   dw1  = nsid
+ *   dw2  = cdw2 (typically reserved)
+ *   dw3  = cdw3
+ *   dw10..dw15 = cdw10..cdw15
+ * Metadata/PRP fields are zeroed.
+ */
+static void plink_build_sqe(uint8_t sqe[PLINK_ADMIN_CMD_LEN],
+			    const struct plink_nvme_passthru_cmd *c)
+{
+	memset(sqe, 0, PLINK_ADMIN_CMD_LEN);
+	uint32_t dw0 = ((uint32_t)1 << 16)          /* cid=1 */
+		     | (((uint32_t)c->flags & 0xff) << 8)
+		     | ((uint32_t)c->opcode & 0xff);
+	memcpy(sqe +  0, &dw0,      4);
+	memcpy(sqe +  4, &c->nsid,  4);
+	memcpy(sqe +  8, &c->cdw2,  4);
+	memcpy(sqe + 12, &c->cdw3,  4);
+	memcpy(sqe + 40, &c->cdw10, 4);
+	memcpy(sqe + 44, &c->cdw11, 4);
+	memcpy(sqe + 48, &c->cdw12, 4);
+	memcpy(sqe + 52, &c->cdw13, 4);
+	memcpy(sqe + 56, &c->cdw14, 4);
+	memcpy(sqe + 60, &c->cdw15, 4);
 }
 
 /* ------------------------------------------------------------------ */
@@ -139,49 +163,57 @@ static int write_full(int fd, const void *buf, size_t n)
 
 static void handle_admin_client(int cfd)
 {
-	uint8_t  cmd[PLINK_ADMIN_CMD_LEN];
-	uint32_t header[2];  /* data_len, direction */
+	struct plink_nvme_passthru_cmd pcmd;
+	uint8_t  sqe[PLINK_ADMIN_CMD_LEN];
 	uint8_t  cpl[PLINK_ADMIN_CPL_LEN];
 	uint8_t  data[PLINK_ADMIN_MAX_DATA];
-	int32_t  rc;
+	int32_t  rc = 0;
+	uint32_t result = 0;
+	int      direction = PLINK_DIR_NONE;
+	uint32_t data_len = 0;
 
 	memset(cpl, 0, sizeof(cpl));
 
-	if (read_full(cfd, cmd, sizeof(cmd)) < 0)
-		return;
-	if (read_full(cfd, header, sizeof(header)) < 0)
+	if (read_full(cfd, &pcmd, sizeof(pcmd)) < 0)
 		return;
 
-	uint32_t data_len  = header[0];
-	uint32_t direction = header[1];
+	data_len  = pcmd.data_len;
+	direction = plink_admin_opcode_direction(pcmd.opcode);
 
 	if (data_len > PLINK_ADMIN_MAX_DATA) {
 		rc = E2BIG;
 		goto reply;
 	}
-	if (direction > 2) {
-		rc = EINVAL;
+
+	/* Bidirectional admin commands aren't supported by our RPC. */
+	if (direction == PLINK_DIR_BIDI) {
+		rc = ENOTSUP;
 		goto reply;
 	}
 
-	if (direction == 1 && data_len) {
+	if (direction == PLINK_DIR_H2D && data_len) {
 		if (read_full(cfd, data, data_len) < 0)
 			return;
 	}
 
-	if (plink_admin_opcode_blocked(cmd)) {
+	if (plink_admin_opcode_blocked(&pcmd)) {
 		rc = EPERM;
 		goto reply;
 	}
 
-	rc = plink_admin_rpc(cmd, cpl, data, data_len, (int)direction);
+	plink_build_sqe(sqe, &pcmd);
+	rc = plink_admin_rpc(sqe, cpl, data, data_len, direction);
+
+	/* CQE dword 0 = command-specific result */
+	if (rc == 0)
+		memcpy(&result, cpl, sizeof(result));
 
 reply:
 	if (write_full(cfd, &rc, sizeof(rc)) < 0)
 		return;
-	if (write_full(cfd, cpl, sizeof(cpl)) < 0)
+	if (write_full(cfd, &result, sizeof(result)) < 0)
 		return;
-	if (rc == 0 && direction == 2 && data_len)
+	if (rc == 0 && direction == PLINK_DIR_D2H && data_len)
 		write_full(cfd, data, data_len);
 }
 

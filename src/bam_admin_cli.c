@@ -102,63 +102,44 @@ static int connect_sock(const char *path)
 
 
 /* ------------------------------------------------------------------ */
-/*  NVMe command construction                                         */
-/* ------------------------------------------------------------------ */
-static void set_u32(uint8_t cmd[ADMIN_CMD_LEN], int dword_idx, uint32_t v)
-{
-	memcpy(cmd + dword_idx * 4, &v, 4);
-}
-
-static void build_header(uint8_t cmd[ADMIN_CMD_LEN],
-			 uint8_t opcode, uint32_t nsid)
-{
-	memset(cmd, 0, ADMIN_CMD_LEN);
-	/* dword[0]: cid<<16 | opcode (fuse=psdt=0). cid=1 arbitrary. */
-	set_u32(cmd, 0, ((uint32_t)1 << 16) | (opcode & 0x7f));
-	set_u32(cmd, 1, nsid);
-}
-
-/* ------------------------------------------------------------------ */
 /*  One-shot transaction                                              */
 /* ------------------------------------------------------------------ */
 struct txn_result {
-	int32_t rc;
-	uint8_t cpl[ADMIN_CPL_LEN];
-	uint8_t data[ADMIN_MAX_DATA];
+	int32_t  rc;
+	uint32_t result;          /* CQE dword0 */
+	uint8_t  data[ADMIN_MAX_DATA];
 	uint32_t data_len;
 };
 
 static void do_txn(const char *sock_path,
-		   const uint8_t cmd[ADMIN_CMD_LEN],
-		   uint32_t data_len, uint32_t direction,
+		   const struct plink_nvme_passthru_cmd *pcmd,
 		   const void *h2d_data,
 		   struct txn_result *out)
 {
-	if (data_len > ADMIN_MAX_DATA)
-		diev("data_len %u exceeds %u", data_len, ADMIN_MAX_DATA);
+	if (pcmd->data_len > ADMIN_MAX_DATA)
+		diev("data_len %u exceeds %u", pcmd->data_len, ADMIN_MAX_DATA);
+
+	int direction = plink_admin_opcode_direction(pcmd->opcode);
 
 	int fd = connect_sock(sock_path);
 
-	if (write_full(fd, cmd, ADMIN_CMD_LEN) < 0)
+	if (write_full(fd, pcmd, sizeof(*pcmd)) < 0)
 		die("write cmd");
-	uint32_t hdr[2] = { data_len, direction };
-	if (write_full(fd, hdr, sizeof(hdr)) < 0)
-		die("write hdr");
-	if (direction == 1 && data_len) {
-		if (write_full(fd, h2d_data, data_len) < 0)
+	if (direction == PLINK_DIR_H2D && pcmd->data_len) {
+		if (write_full(fd, h2d_data, pcmd->data_len) < 0)
 			die("write data");
 	}
 
 	if (read_full(fd, &out->rc, sizeof(out->rc)) < 0)
 		die("read rc");
-	if (read_full(fd, out->cpl, ADMIN_CPL_LEN) < 0)
-		die("read cpl");
+	if (read_full(fd, &out->result, sizeof(out->result)) < 0)
+		die("read result");
 
 	out->data_len = 0;
-	if (out->rc == 0 && direction == 2 && data_len) {
-		if (read_full(fd, out->data, data_len) < 0)
+	if (out->rc == 0 && direction == PLINK_DIR_D2H && pcmd->data_len) {
+		if (read_full(fd, out->data, pcmd->data_len) < 0)
 			die("read data");
-		out->data_len = data_len;
+		out->data_len = pcmd->data_len;
 	}
 
 	close(fd);
@@ -200,28 +181,26 @@ static void report_rc(const struct txn_result *r)
 		fprintf(stderr, "rc=%d (NVM error)\n", r->rc);
 }
 
-static void print_cpl(const uint8_t cpl[ADMIN_CPL_LEN])
-{
-	uint32_t d0, d1, d2, d3;
-	memcpy(&d0, cpl +  0, 4);
-	memcpy(&d1, cpl +  4, 4);
-	memcpy(&d2, cpl +  8, 4);
-	memcpy(&d3, cpl + 12, 4);
-	printf("cpl: dw0=0x%08x dw1=0x%08x dw2=0x%08x dw3=0x%08x\n",
-	       d0, d1, d2, d3);
-}
-
 /* ------------------------------------------------------------------ */
 /*  Subcommands                                                       */
 /* ------------------------------------------------------------------ */
+static void passthru_init(struct plink_nvme_passthru_cmd *c,
+			  uint8_t opcode, uint32_t nsid)
+{
+	memset(c, 0, sizeof(*c));
+	c->opcode = opcode;
+	c->nsid   = nsid;
+}
+
 static int cmd_id_ctrl(const char *sock)
 {
-	uint8_t cmd[ADMIN_CMD_LEN];
-	build_header(cmd, 0x06, 0);       /* IDENTIFY */
-	set_u32(cmd, 10, 0x01);            /* CNS=1: Identify Controller */
+	struct plink_nvme_passthru_cmd c;
+	passthru_init(&c, 0x06, 0);           /* IDENTIFY */
+	c.cdw10    = 0x01;                     /* CNS=1: Identify Controller */
+	c.data_len = 4096;
 
 	struct txn_result r;
-	do_txn(sock, cmd, 4096, 2, NULL, &r);
+	do_txn(sock, &c, NULL, &r);
 	report_rc(&r);
 	if (r.rc == 0)
 		hex_dump(r.data, r.data_len);
@@ -230,12 +209,13 @@ static int cmd_id_ctrl(const char *sock)
 
 static int cmd_id_ns(const char *sock, uint32_t nsid)
 {
-	uint8_t cmd[ADMIN_CMD_LEN];
-	build_header(cmd, 0x06, nsid);
-	set_u32(cmd, 10, 0x00);            /* CNS=0: Identify Namespace */
+	struct plink_nvme_passthru_cmd c;
+	passthru_init(&c, 0x06, nsid);
+	c.cdw10    = 0x00;                     /* CNS=0: Identify Namespace */
+	c.data_len = 4096;
 
 	struct txn_result r;
-	do_txn(sock, cmd, 4096, 2, NULL, &r);
+	do_txn(sock, &c, NULL, &r);
 	report_rc(&r);
 	if (r.rc == 0)
 		hex_dump(r.data, r.data_len);
@@ -245,23 +225,21 @@ static int cmd_id_ns(const char *sock, uint32_t nsid)
 static int cmd_get_log(const char *sock, uint8_t lid,
 		       uint32_t size, uint32_t nsid)
 {
-	uint8_t cmd[ADMIN_CMD_LEN];
-	build_header(cmd, 0x02, nsid);
-
-	/* NUMD (0-based) = (size / 4) - 1, in the low 16 bits of dword[10]
-	 * are NUMDL + LID. NVMe 1.3+ split: dword[10] = NUMDL<<16 | LID. */
+	/* NUMD (0-based) = (size / 4) - 1. NVMe 1.3+: dword[10] =
+	 * NUMDL<<16 | LID. */
 	if (size == 0 || (size & 3))
 		diev("get-log size %u must be nonzero multiple of 4", size);
 	uint32_t numd = (size / 4) - 1;
 	if (numd > 0xffff)
 		diev("get-log size %u exceeds 256KB (NUMDL limit)", size);
-	set_u32(cmd, 10, ((uint32_t)(numd & 0xffff) << 16) | lid);
-	set_u32(cmd, 11, 0);
-	set_u32(cmd, 12, 0);
-	set_u32(cmd, 13, 0);
+
+	struct plink_nvme_passthru_cmd c;
+	passthru_init(&c, 0x02, nsid);
+	c.cdw10    = ((uint32_t)(numd & 0xffff) << 16) | lid;
+	c.data_len = size;
 
 	struct txn_result r;
-	do_txn(sock, cmd, size, 2, NULL, &r);
+	do_txn(sock, &c, NULL, &r);
 	report_rc(&r);
 	if (r.rc == 0)
 		hex_dump(r.data, r.data_len);
@@ -271,43 +249,35 @@ static int cmd_get_log(const char *sock, uint8_t lid,
 static int cmd_get_features(const char *sock, uint8_t fid, uint8_t sel,
 			    uint32_t nsid, uint32_t data_len)
 {
-	uint8_t cmd[ADMIN_CMD_LEN];
-	build_header(cmd, 0x0a, nsid);
-
+	struct plink_nvme_passthru_cmd c;
+	passthru_init(&c, 0x0a, nsid);
 	/* dword[10]: SEL[10:8] | FID[7:0]
 	 *   SEL 000 current, 001 default, 010 saved, 011 supported caps */
-	set_u32(cmd, 10, ((uint32_t)(sel & 0x7) << 8) | fid);
-
-	/*
-	 * Most Get Features commands return their value in completion
-	 * dword[0]. Some (LBA Range Type, Host Identifier, Timestamp,
-	 * Host Memory Buffer info, ...) also write a payload via PRP1;
-	 * pass data_len > 0 to receive it.
-	 */
-	uint32_t direction = data_len ? 2 : 0;
+	c.cdw10    = ((uint32_t)(sel & 0x7) << 8) | fid;
+	c.data_len = data_len;
 
 	struct txn_result r;
-	do_txn(sock, cmd, data_len, direction, NULL, &r);
+	do_txn(sock, &c, NULL, &r);
 	report_rc(&r);
 	if (r.rc == 0) {
-		print_cpl(r.cpl);
+		printf("result (cqe dw0) = 0x%08x\n", r.result);
 		if (r.data_len)
 			hex_dump(r.data, r.data_len);
 	}
 	return r.rc ? 1 : 0;
 }
 
-static int parse_hex_cmd(const char *hex, uint8_t cmd[ADMIN_CMD_LEN])
+static int parse_hex_cmd(const char *hex, uint8_t out[ADMIN_CMD_LEN])
 {
 	size_t n = 0;
-	memset(cmd, 0, ADMIN_CMD_LEN);
+	memset(out, 0, ADMIN_CMD_LEN);
 	while (*hex && n < ADMIN_CMD_LEN) {
 		while (*hex && !isxdigit((unsigned char)*hex))
 			hex++;
 		if (!*hex || !isxdigit((unsigned char)hex[1]))
 			return -1;
 		char buf[3] = { hex[0], hex[1], 0 };
-		cmd[n++] = (uint8_t)strtoul(buf, NULL, 16);
+		out[n++] = (uint8_t)strtoul(buf, NULL, 16);
 		hex += 2;
 	}
 	return (int)n;
@@ -315,20 +285,41 @@ static int parse_hex_cmd(const char *hex, uint8_t cmd[ADMIN_CMD_LEN])
 
 static int cmd_raw(const char *sock, const char *hex, uint32_t data_len)
 {
-	uint8_t cmd[ADMIN_CMD_LEN];
-	int n = parse_hex_cmd(hex, cmd);
+	uint8_t sqe[ADMIN_CMD_LEN];
+	int n = parse_hex_cmd(hex, sqe);
 	if (n < 0)
 		die("raw: malformed hex input");
 	if (n != ADMIN_CMD_LEN)
 		diev("raw: expected 64 bytes of hex, got %d", n);
 
-	uint32_t direction = data_len ? 2 : 0;
+	/* Project the 64-byte SQE onto a passthru command. The server
+	 * rebuilds the SQE from these fields; PRP1/PRP2 are server-side. */
+	uint32_t dw0;
+	memcpy(&dw0, sqe + 0, 4);
+
+	struct plink_nvme_passthru_cmd c;
+	memset(&c, 0, sizeof(c));
+	c.opcode = (uint8_t)(dw0 & 0xff);
+	c.flags  = (uint8_t)((dw0 >> 8) & 0xff);
+	memcpy(&c.nsid,  sqe +  4, 4);
+	memcpy(&c.cdw2,  sqe +  8, 4);
+	memcpy(&c.cdw3,  sqe + 12, 4);
+	memcpy(&c.cdw10, sqe + 40, 4);
+	memcpy(&c.cdw11, sqe + 44, 4);
+	memcpy(&c.cdw12, sqe + 48, 4);
+	memcpy(&c.cdw13, sqe + 52, 4);
+	memcpy(&c.cdw14, sqe + 56, 4);
+	memcpy(&c.cdw15, sqe + 60, 4);
+	c.data_len = data_len;
 
 	struct txn_result r;
-	do_txn(sock, cmd, data_len, direction, NULL, &r);
+	do_txn(sock, &c, NULL, &r);
 	report_rc(&r);
-	if (r.rc == 0 && r.data_len)
-		hex_dump(r.data, r.data_len);
+	if (r.rc == 0) {
+		printf("result (cqe dw0) = 0x%08x\n", r.result);
+		if (r.data_len)
+			hex_dump(r.data, r.data_len);
+	}
 	return r.rc ? 1 : 0;
 }
 
