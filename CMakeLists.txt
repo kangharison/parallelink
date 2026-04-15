@@ -113,6 +113,10 @@ add_executable(bam-admin-cli
     src/bam_admin_cli.c
 )
 
+target_include_directories(bam-admin-cli PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 target_compile_definitions(bam-admin-cli PRIVATE _GNU_SOURCE)
 
 # -------------------------------------------------------------------

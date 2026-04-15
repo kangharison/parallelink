@@ -2,28 +2,18 @@
  * bam-admin-cli: out-of-band NVMe admin command injector for the
  * parallelink fio engine.
  *
- * Connects to /tmp/bam-admin-<pid>.sock (created by the engine's
- * admin helper thread) and forwards a single NVMe admin command
- * per invocation. Supports a handful of convenience subcommands
+ * Connects to PLINK_ADMIN_SOCKET_PATH (created by the engine's admin
+ * helper thread) and forwards a single NVMe admin command per
+ * invocation. Supports a handful of convenience subcommands
  * (id-ctrl, id-ns, smart-log, get-log) plus a raw escape hatch for
  * anything else.
  *
- * Wire protocol (matches gpu_engine.c):
- *   request:
- *     [ 64 B ] nvm_cmd_t (raw SQE, opcode in byte[0] bits [7:0])
- *     [  4 B ] uint32_t data_len
- *     [  4 B ] uint32_t direction (0=none, 1=h2d, 2=d2h)
- *     [  data_len B ] payload when direction==1
- *   response:
- *     [  4 B ] int32_t rc (0=ok, <0=NVM err, >0=errno)
- *     [ 16 B ] nvm_cpl_t completion entry
- *     [  data_len B ] payload when direction==2 and rc==0
+ * Wire protocol: see include/plink_admin_wire.h.
  */
 
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
-#include <glob.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,9 +23,11 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "plink_admin_wire.h"
+
 #define ADMIN_CMD_LEN   64
 #define ADMIN_CPL_LEN   16
-#define ADMIN_MAX_DATA  4096
+#define ADMIN_MAX_DATA  PLINK_ADMIN_WIRE_MAX_DATA
 
 static void die(const char *msg)
 {
@@ -108,30 +100,6 @@ static int connect_sock(const char *path)
 	return fd;
 }
 
-static char *resolve_sock_path(int pid)
-{
-	static char buf[128];
-	if (pid > 0) {
-		snprintf(buf, sizeof(buf), "/tmp/bam-admin-%d.sock", pid);
-		return buf;
-	}
-
-	glob_t g;
-	int rc = glob("/tmp/bam-admin-*.sock", 0, NULL, &g);
-	if (rc != 0)
-		die("no /tmp/bam-admin-*.sock found. Use --pid.");
-	if (g.gl_pathc > 1) {
-		fprintf(stderr,
-			"bam-admin-cli: multiple sockets found:\n");
-		for (size_t i = 0; i < g.gl_pathc; i++)
-			fprintf(stderr, "  %s\n", g.gl_pathv[i]);
-		globfree(&g);
-		die("pass --pid <pid> to disambiguate.");
-	}
-	snprintf(buf, sizeof(buf), "%s", g.gl_pathv[0]);
-	globfree(&g);
-	return buf;
-}
 
 /* ------------------------------------------------------------------ */
 /*  NVMe command construction                                         */
@@ -370,7 +338,7 @@ static int cmd_raw(const char *sock, const char *hex, uint32_t data_len)
 static void usage(void)
 {
 	fprintf(stderr,
-"Usage: bam-admin-cli [--pid <pid>] <subcommand> [args...]\n"
+"Usage: bam-admin-cli <subcommand> [args...]\n"
 "\n"
 "Subcommands:\n"
 "  id-ctrl                           Identify Controller (4 KB)\n"
@@ -381,20 +349,16 @@ static void usage(void)
 "                                    Get Features (sel: 0=cur 1=def 2=saved 3=caps)\n"
 "  raw <64-byte hex> [data_len]      Raw SQE, optional dev->host payload\n"
 "\n"
-"Without --pid, globs /tmp/bam-admin-*.sock. Multiple sockets => error.\n");
+"Connects to " PLINK_ADMIN_SOCKET_PATH ".\n");
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	int pid = 0;
 	int i = 1;
 
 	while (i < argc && strncmp(argv[i], "--", 2) == 0) {
-		if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
-			pid = atoi(argv[i + 1]);
-			i += 2;
-		} else if (!strcmp(argv[i], "--help")) {
+		if (!strcmp(argv[i], "--help")) {
 			usage();
 		} else {
 			diev("unknown flag %s", argv[i]);
@@ -403,7 +367,7 @@ int main(int argc, char **argv)
 	if (i >= argc)
 		usage();
 
-	const char *sock = resolve_sock_path(pid);
+	const char *sock = PLINK_ADMIN_SOCKET_PATH;
 	const char *sub = argv[i++];
 
 	if (!strcmp(sub, "id-ctrl")) {

@@ -28,6 +28,7 @@
 #include "optgroup.h"
 
 #include "gpu_engine.h"
+#include "plink_admin_wire.h"
 
 /* Wire protocol: see docs/design or the bam-admin-cli source. */
 #define PLINK_ADMIN_CMD_LEN 64
@@ -64,7 +65,6 @@ struct plink_data {
 	int           admin_listen_fd;
 	volatile int  admin_run;
 	int           admin_enabled;
-	char          admin_sock_path[128];
 };
 
 /* ------------------------------------------------------------------ */
@@ -212,9 +212,7 @@ static int plink_admin_start(struct plink_data *pd)
 		return -1;
 	}
 
-	snprintf(pd->admin_sock_path, sizeof(pd->admin_sock_path),
-		 "/tmp/bam-admin-%d.sock", (int)getpid());
-	unlink(pd->admin_sock_path);
+	unlink(PLINK_ADMIN_SOCKET_PATH);
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -226,12 +224,12 @@ static int plink_admin_start(struct plink_data *pd)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, pd->admin_sock_path,
+	strncpy(addr.sun_path, PLINK_ADMIN_SOCKET_PATH,
 		sizeof(addr.sun_path) - 1);
 
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		log_err("parallelink: admin bind(%s) failed: %s\n",
-			pd->admin_sock_path, strerror(errno));
+			PLINK_ADMIN_SOCKET_PATH, strerror(errno));
 		close(fd);
 		plink_admin_teardown();
 		return -1;
@@ -240,7 +238,7 @@ static int plink_admin_start(struct plink_data *pd)
 		log_err("parallelink: admin listen failed: %s\n",
 			strerror(errno));
 		close(fd);
-		unlink(pd->admin_sock_path);
+		unlink(PLINK_ADMIN_SOCKET_PATH);
 		plink_admin_teardown();
 		return -1;
 	}
@@ -252,14 +250,14 @@ static int plink_admin_start(struct plink_data *pd)
 			   plink_admin_thread, pd) != 0) {
 		log_err("parallelink: pthread_create(admin) failed\n");
 		close(fd);
-		unlink(pd->admin_sock_path);
+		unlink(PLINK_ADMIN_SOCKET_PATH);
 		plink_admin_teardown();
 		return -1;
 	}
 
 	pd->admin_enabled = 1;
 	log_info("parallelink: admin socket ready at %s\n",
-		 pd->admin_sock_path);
+		 PLINK_ADMIN_SOCKET_PATH);
 	return 0;
 }
 
@@ -280,7 +278,7 @@ static void plink_admin_stop(struct plink_data *pd)
 		pd->admin_listen_fd = -1;
 	}
 	pthread_join(pd->admin_thr, NULL);
-	unlink(pd->admin_sock_path);
+	unlink(PLINK_ADMIN_SOCKET_PATH);
 	plink_admin_teardown();
 	pd->admin_enabled = 0;
 }
