@@ -232,6 +232,17 @@ static void report_rc(const struct txn_result *r)
 		fprintf(stderr, "rc=%d (NVM error)\n", r->rc);
 }
 
+static void print_cpl(const uint8_t cpl[ADMIN_CPL_LEN])
+{
+	uint32_t d0, d1, d2, d3;
+	memcpy(&d0, cpl +  0, 4);
+	memcpy(&d1, cpl +  4, 4);
+	memcpy(&d2, cpl +  8, 4);
+	memcpy(&d3, cpl + 12, 4);
+	printf("cpl: dw0=0x%08x dw1=0x%08x dw2=0x%08x dw3=0x%08x\n",
+	       d0, d1, d2, d3);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Subcommands                                                       */
 /* ------------------------------------------------------------------ */
@@ -289,6 +300,35 @@ static int cmd_get_log(const char *sock, uint8_t lid,
 	return r.rc ? 1 : 0;
 }
 
+static int cmd_get_features(const char *sock, uint8_t fid, uint8_t sel,
+			    uint32_t nsid, uint32_t data_len)
+{
+	uint8_t cmd[ADMIN_CMD_LEN];
+	build_header(cmd, 0x0a, nsid);
+
+	/* dword[10]: SEL[10:8] | FID[7:0]
+	 *   SEL 000 current, 001 default, 010 saved, 011 supported caps */
+	set_u32(cmd, 10, ((uint32_t)(sel & 0x7) << 8) | fid);
+
+	/*
+	 * Most Get Features commands return their value in completion
+	 * dword[0]. Some (LBA Range Type, Host Identifier, Timestamp,
+	 * Host Memory Buffer info, ...) also write a payload via PRP1;
+	 * pass data_len > 0 to receive it.
+	 */
+	uint32_t direction = data_len ? 2 : 0;
+
+	struct txn_result r;
+	do_txn(sock, cmd, data_len, direction, NULL, &r);
+	report_rc(&r);
+	if (r.rc == 0) {
+		print_cpl(r.cpl);
+		if (r.data_len)
+			hex_dump(r.data, r.data_len);
+	}
+	return r.rc ? 1 : 0;
+}
+
 static int parse_hex_cmd(const char *hex, uint8_t cmd[ADMIN_CMD_LEN])
 {
 	size_t n = 0;
@@ -337,6 +377,8 @@ static void usage(void)
 "  id-ns <nsid>                      Identify Namespace (4 KB)\n"
 "  smart-log [nsid]                  Get Log Page LID=0x02 (512 B)\n"
 "  get-log <lid> <size> [nsid]       Get arbitrary log page\n"
+"  get-features <fid> [sel] [nsid] [data_len]\n"
+"                                    Get Features (sel: 0=cur 1=def 2=saved 3=caps)\n"
 "  raw <64-byte hex> [data_len]      Raw SQE, optional dev->host payload\n"
 "\n"
 "Without --pid, globs /tmp/bam-admin-*.sock. Multiple sockets => error.\n");
@@ -384,6 +426,20 @@ int main(int argc, char **argv)
 		if (i < argc)
 			nsid = (uint32_t)strtoul(argv[i], NULL, 0);
 		return cmd_get_log(sock, lid, size, nsid);
+	} else if (!strcmp(sub, "get-features")) {
+		if (i >= argc)
+			die("get-features: missing fid");
+		uint8_t  fid      = (uint8_t)strtoul(argv[i++], NULL, 0);
+		uint8_t  sel      = 0;
+		uint32_t nsid     = 0;
+		uint32_t data_len = 0;
+		if (i < argc)
+			sel      = (uint8_t)strtoul(argv[i++], NULL, 0);
+		if (i < argc)
+			nsid     = (uint32_t)strtoul(argv[i++], NULL, 0);
+		if (i < argc)
+			data_len = (uint32_t)strtoul(argv[i++], NULL, 0);
+		return cmd_get_features(sock, fid, sel, nsid, data_len);
 	} else if (!strcmp(sub, "raw")) {
 		if (i >= argc)
 			die("raw: missing hex");
