@@ -36,8 +36,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <stdexcept>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "gpu_engine.h"
 
@@ -49,6 +52,9 @@
 #include <nvm_parallel_queue.h>
 #include <nvm_cmd.h>
 #include <nvm_io.h>
+#include <nvm_rpc.h>
+#include <nvm_dma.h>
+#include <nvm_error.h>
 
 /* ------------------------------------------------------------------ */
 /*  Host-side context kept alive across init → launch → shutdown      */
@@ -374,6 +380,114 @@ extern "C" int plink_gpu_poll_done(struct plink_shared_state *state)
 
 	state->done_mirror = mirror;
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Admin command injection bridge                                    */
+/*                                                                    */
+/*  A single dedicated host DMA page mapped into the controller. The  */
+/*  admin helper thread in gpu_engine.c forwards socket requests here */
+/*  and we serialize with an internal mutex on top of BaM's own lock  */
+/*  inside nvm_raw_rpc(), since it costs nothing and keeps the admin  */
+/*  path independent of any future callers.                           */
+/* ------------------------------------------------------------------ */
+static struct {
+	nvm_dma_t      *dma;
+	void           *buf;
+	pthread_mutex_t lock;
+	bool            initialized;
+} g_admin = { nullptr, nullptr, PTHREAD_MUTEX_INITIALIZER, false };
+
+extern "C" int plink_admin_init(void)
+{
+	if (g_admin.initialized)
+		return 0;
+	if (!g_ctx.ctrl || !g_ctx.ctrl->ctrl || !g_ctx.ctrl->aq_ref) {
+		fprintf(stderr,
+			"parallelink: admin_init before controller ready\n");
+		return -1;
+	}
+
+	long ps = sysconf(_SC_PAGESIZE);
+	if (ps <= 0)
+		ps = 4096;
+
+	void *buf = nullptr;
+	if (posix_memalign(&buf, (size_t)ps, PLINK_ADMIN_MAX_DATA) != 0)
+		return -1;
+	memset(buf, 0, PLINK_ADMIN_MAX_DATA);
+
+	int status = nvm_dma_map_host(&g_admin.dma, g_ctx.ctrl->ctrl,
+				      buf, PLINK_ADMIN_MAX_DATA);
+	if (!nvm_ok(status)) {
+		fprintf(stderr,
+			"parallelink: nvm_dma_map_host(admin) failed: %s\n",
+			nvm_strerror(status));
+		free(buf);
+		return -1;
+	}
+
+	g_admin.buf         = buf;
+	g_admin.initialized = true;
+	return 0;
+}
+
+extern "C" int plink_admin_rpc(const void *cmd_in, void *cpl_out,
+			       void *data, uint32_t data_len, int direction)
+{
+	if (!g_admin.initialized)
+		return EINVAL;
+	if (data_len > PLINK_ADMIN_MAX_DATA)
+		return E2BIG;
+	if (!cmd_in || !cpl_out)
+		return EINVAL;
+
+	pthread_mutex_lock(&g_admin.lock);
+
+	nvm_cmd_t cmd;
+	nvm_cpl_t cpl;
+	memcpy(&cmd, cmd_in, sizeof(cmd));
+	memset(&cpl, 0, sizeof(cpl));
+
+	/*
+	 * Force PRP1 to our admin buffer regardless of what the client
+	 * filled in. Clients have no idea what bus address our dma buf
+	 * lives at; keeping this authoritative on the server side is
+	 * both simpler and safer.
+	 */
+	nvm_cmd_data_ptr(&cmd,
+			 g_admin.dma ? g_admin.dma->ioaddrs[0] : 0,
+			 0);
+
+	if (direction == 1 && data && data_len)
+		memcpy(g_admin.buf, data, data_len);
+	else
+		memset(g_admin.buf, 0, PLINK_ADMIN_MAX_DATA);
+
+	int rc = nvm_raw_rpc(g_ctx.ctrl->aq_ref, &cmd, &cpl);
+
+	memcpy(cpl_out, &cpl, sizeof(cpl));
+
+	if (rc == 0 && direction == 2 && data && data_len)
+		memcpy(data, g_admin.buf, data_len);
+
+	pthread_mutex_unlock(&g_admin.lock);
+	return rc;
+}
+
+extern "C" void plink_admin_teardown(void)
+{
+	if (!g_admin.initialized)
+		return;
+	if (g_admin.dma) {
+		nvm_dma_unmap(g_admin.dma);
+		g_admin.dma = nullptr;
+	}
+	if (g_admin.buf) {
+		free(g_admin.buf);
+		g_admin.buf = nullptr;
+	}
+	g_admin.initialized = false;
 }
 
 extern "C" void plink_gpu_shutdown(struct plink_shared_state *state)

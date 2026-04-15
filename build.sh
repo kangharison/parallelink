@@ -197,6 +197,7 @@ fi
 # parallelink engine + holder daemon
 cp -f "${PLINK_BUILD}/parallelink.so" "${DIST}/parallelink.so"
 cp -f "${PLINK_BUILD}/plink-holder"   "${DIST}/plink-holder"
+cp -f "${PLINK_BUILD}/bam-admin-cli"  "${DIST}/bam-admin-cli"
 
 # Convenience runner: wraps fio with FIO_EXT_ENG_DIR + LD_LIBRARY_PATH
 cat > "${DIST}/run-fio.sh" <<'RUN'

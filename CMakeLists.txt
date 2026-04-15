@@ -93,6 +93,7 @@ set_source_files_properties(src/gpu_worker.cu PROPERTIES
 target_link_libraries(parallelink PRIVATE
     CUDA::cudart
     ${LIBNVM_LIB}
+    pthread
 )
 
 # fio expects the engine symbol to be visible
@@ -100,6 +101,19 @@ set_target_properties(parallelink PROPERTIES
     PREFIX ""                          # no "lib" prefix
     POSITION_INDEPENDENT_CODE ON
 )
+
+# -------------------------------------------------------------------
+#  bam-admin-cli: out-of-band NVMe admin command injector
+#
+#  Tiny standalone client that talks to the parallelink engine's
+#  admin helper socket. No CUDA / no libnvm dependency — it only
+#  speaks the wire protocol.
+# -------------------------------------------------------------------
+add_executable(bam-admin-cli
+    src/bam_admin_cli.c
+)
+
+target_compile_definitions(bam-admin-cli PRIVATE _GNU_SOURCE)
 
 # -------------------------------------------------------------------
 #  Holder daemon (keeps GPU memory alive across fio runs)

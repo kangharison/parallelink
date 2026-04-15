@@ -14,12 +14,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <stdint.h>
 
 #include "config-host.h"
 #include "fio.h"
 #include "optgroup.h"
 
 #include "gpu_engine.h"
+
+/* Wire protocol: see docs/design or the bam-admin-cli source. */
+#define PLINK_ADMIN_CMD_LEN 64
+#define PLINK_ADMIN_CPL_LEN 16
 
 struct plink_options {
 	struct thread_data *td;
@@ -46,7 +58,232 @@ struct plink_data {
 	unsigned int  head;
 	unsigned int  tail;
 	unsigned int  nr;
+
+	/* Admin command injection helper thread. */
+	pthread_t     admin_thr;
+	int           admin_listen_fd;
+	volatile int  admin_run;
+	int           admin_enabled;
+	char          admin_sock_path[128];
 };
+
+/* ------------------------------------------------------------------ */
+/*  Admin helper: opcode blacklist                                    */
+/* ------------------------------------------------------------------ */
+/*
+ * NVMe admin command layout (all little-endian):
+ *   dword[0] bits [7:0]  = opcode
+ *   dword[10]            = CDW10 (for Set Features, bits [7:0] = FID)
+ */
+static int plink_admin_opcode_blocked(const uint8_t *cmd)
+{
+	uint8_t opcode = cmd[0];    /* full 8-bit admin opcode */
+	uint32_t cdw10;
+
+	switch (opcode) {
+	case 0x00: /* Delete I/O SQ       */
+	case 0x01: /* Create I/O SQ       */
+	case 0x04: /* Delete I/O CQ       */
+	case 0x05: /* Create I/O CQ       */
+	case 0x10: /* Firmware Commit     */
+	case 0x11: /* Firmware Download   */
+	case 0x80: /* Format NVM          */
+	case 0x84: /* Sanitize            */
+		return 1;
+	case 0x09: /* Set Features */
+		memcpy(&cdw10, cmd + 40, sizeof(cdw10));
+		if ((cdw10 & 0xff) == 0x07) /* Number of Queues */
+			return 1;
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/*  Admin helper: I/O utilities                                       */
+/* ------------------------------------------------------------------ */
+static int read_full(int fd, void *buf, size_t n)
+{
+	uint8_t *p = buf;
+	while (n) {
+		ssize_t r = read(fd, p, n);
+		if (r == 0)
+			return -1;
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		p += r;
+		n -= (size_t)r;
+	}
+	return 0;
+}
+
+static int write_full(int fd, const void *buf, size_t n)
+{
+	const uint8_t *p = buf;
+	while (n) {
+		ssize_t r = write(fd, p, n);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		p += r;
+		n -= (size_t)r;
+	}
+	return 0;
+}
+
+static void handle_admin_client(int cfd)
+{
+	uint8_t  cmd[PLINK_ADMIN_CMD_LEN];
+	uint32_t header[2];  /* data_len, direction */
+	uint8_t  cpl[PLINK_ADMIN_CPL_LEN];
+	uint8_t  data[PLINK_ADMIN_MAX_DATA];
+	int32_t  rc;
+
+	memset(cpl, 0, sizeof(cpl));
+
+	if (read_full(cfd, cmd, sizeof(cmd)) < 0)
+		return;
+	if (read_full(cfd, header, sizeof(header)) < 0)
+		return;
+
+	uint32_t data_len  = header[0];
+	uint32_t direction = header[1];
+
+	if (data_len > PLINK_ADMIN_MAX_DATA) {
+		rc = E2BIG;
+		goto reply;
+	}
+	if (direction > 2) {
+		rc = EINVAL;
+		goto reply;
+	}
+
+	if (direction == 1 && data_len) {
+		if (read_full(cfd, data, data_len) < 0)
+			return;
+	}
+
+	if (plink_admin_opcode_blocked(cmd)) {
+		rc = EPERM;
+		goto reply;
+	}
+
+	rc = plink_admin_rpc(cmd, cpl, data, data_len, (int)direction);
+
+reply:
+	if (write_full(cfd, &rc, sizeof(rc)) < 0)
+		return;
+	if (write_full(cfd, cpl, sizeof(cpl)) < 0)
+		return;
+	if (rc == 0 && direction == 2 && data_len)
+		write_full(cfd, data, data_len);
+}
+
+static void *plink_admin_thread(void *arg)
+{
+	struct plink_data *pd = arg;
+
+	while (__atomic_load_n(&pd->admin_run, __ATOMIC_ACQUIRE)) {
+		int cfd = accept(pd->admin_listen_fd, NULL, NULL);
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		handle_admin_client(cfd);
+		close(cfd);
+	}
+	return NULL;
+}
+
+static int plink_admin_start(struct plink_data *pd)
+{
+	struct sockaddr_un addr;
+	int fd;
+
+	if (plink_admin_init() != 0) {
+		log_err("parallelink: admin init failed, admin socket disabled\n");
+		return -1;
+	}
+
+	snprintf(pd->admin_sock_path, sizeof(pd->admin_sock_path),
+		 "/tmp/bam-admin-%d.sock", (int)getpid());
+	unlink(pd->admin_sock_path);
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) {
+		log_err("parallelink: admin socket() failed: %s\n",
+			strerror(errno));
+		plink_admin_teardown();
+		return -1;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, pd->admin_sock_path,
+		sizeof(addr.sun_path) - 1);
+
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		log_err("parallelink: admin bind(%s) failed: %s\n",
+			pd->admin_sock_path, strerror(errno));
+		close(fd);
+		plink_admin_teardown();
+		return -1;
+	}
+	if (listen(fd, 4) < 0) {
+		log_err("parallelink: admin listen failed: %s\n",
+			strerror(errno));
+		close(fd);
+		unlink(pd->admin_sock_path);
+		plink_admin_teardown();
+		return -1;
+	}
+
+	pd->admin_listen_fd = fd;
+	pd->admin_run       = 1;
+
+	if (pthread_create(&pd->admin_thr, NULL,
+			   plink_admin_thread, pd) != 0) {
+		log_err("parallelink: pthread_create(admin) failed\n");
+		close(fd);
+		unlink(pd->admin_sock_path);
+		plink_admin_teardown();
+		return -1;
+	}
+
+	pd->admin_enabled = 1;
+	log_info("parallelink: admin socket ready at %s\n",
+		 pd->admin_sock_path);
+	return 0;
+}
+
+static void plink_admin_stop(struct plink_data *pd)
+{
+	if (!pd->admin_enabled)
+		return;
+
+	__atomic_store_n(&pd->admin_run, 0, __ATOMIC_RELEASE);
+
+	/*
+	 * Unblock accept() by shutting down the listen socket. The helper
+	 * thread sees run==0 next iteration and bails.
+	 */
+	if (pd->admin_listen_fd >= 0) {
+		shutdown(pd->admin_listen_fd, SHUT_RDWR);
+		close(pd->admin_listen_fd);
+		pd->admin_listen_fd = -1;
+	}
+	pthread_join(pd->admin_thr, NULL);
+	unlink(pd->admin_sock_path);
+	plink_admin_teardown();
+	pd->admin_enabled = 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Engine-specific fio options                                       */
@@ -111,6 +348,24 @@ static int fio_plink_init(struct thread_data *td)
 	log_info("parallelink: build=%s\n", PLINK_BUILD_TYPE);
 
 	/*
+	 * The engine owns a single CUDA context, one /dev/libnvm0 fd and a
+	 * pile of DMA mappings. Forking (thread=0, numjobs>1) copies the
+	 * parent's FDs but not the CUDA context, which leaves the child
+	 * holding half-valid state. Refuse those configurations outright
+	 * so the user gets a clear error instead of a mysterious crash.
+	 */
+	if (td->o.numjobs != 1) {
+		log_err("parallelink: numjobs must be 1 (got %u)\n",
+			td->o.numjobs);
+		return -EINVAL;
+	}
+	if (!td->o.use_thread) {
+		log_err("parallelink: thread=1 required "
+			"(fork mode would break CUDA/DMA state)\n");
+		return -EINVAL;
+	}
+
+	/*
 	 * Diskless engine: register a dummy file so fio's get_next_file()
 	 * has something to hand back in io_u->file. Without this the I/O
 	 * loop hits NULL and bails out of get_io_u() immediately.
@@ -132,6 +387,9 @@ static int fio_plink_init(struct thread_data *td)
 		free(pd);
 		return -ENOMEM;
 	}
+	pd->admin_listen_fd = -1;
+	pd->admin_run       = 0;
+	pd->admin_enabled   = 0;
 
 	ret = plink_gpu_init(&pd->state, o->gpu_id, o->nvme_dev,
 			     o->n_queues, 256);
@@ -174,6 +432,13 @@ static int fio_plink_init(struct thread_data *td)
 		free(pd);
 		return ret;
 	}
+
+	/*
+	 * Bring up the admin injection helper. Non-fatal if it fails —
+	 * the main I/O engine keeps working, only out-of-band admin
+	 * commands are unavailable.
+	 */
+	(void)plink_admin_start(pd);
 
 	td->io_ops_data = pd;
 	return 0;
@@ -279,6 +544,7 @@ static void fio_plink_cleanup(struct thread_data *td)
 	struct plink_data *pd = td->io_ops_data;
 
 	if (pd) {
+		plink_admin_stop(pd);
 		plink_gpu_shutdown(pd->state);
 		free(pd->queued);
 		free(pd);

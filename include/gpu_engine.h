@@ -79,6 +79,30 @@ int plink_gpu_poll_done(struct plink_shared_state *state);
 /* Stop the persistent kernel and release GPU resources */
 void plink_gpu_shutdown(struct plink_shared_state *state);
 
+/* ------------------------------------------------------------------ */
+/*  Admin command injection bridge                                    */
+/*                                                                    */
+/*  These functions let the fio engine forward raw NVMe admin         */
+/*  commands from an out-of-band Unix-domain socket to the controller */
+/*  that BaM already owns. The admin path lives entirely on the host  */
+/*  (nvm_raw_rpc) and is independent of the persistent I/O kernel,    */
+/*  so it can be used while a workload is running.                    */
+/*                                                                    */
+/*  Direction values for plink_admin_rpc():                           */
+/*    0 = no data transfer                                            */
+/*    1 = host->device (controller reads from admin buffer)           */
+/*    2 = device->host (controller writes into admin buffer)          */
+/* ------------------------------------------------------------------ */
+
+/* Maximum per-request data payload. Limited to one MPS (NVMe memory
+ * page) so that the admin command can use PRP1 alone. */
+#define PLINK_ADMIN_MAX_DATA 4096
+
+int  plink_admin_init(void);
+int  plink_admin_rpc(const void *cmd64, void *cpl16,
+		     void *data, uint32_t data_len, int direction);
+void plink_admin_teardown(void);
+
 #ifdef __cplusplus
 }
 #endif
