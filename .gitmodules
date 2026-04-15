@@ -4,3 +4,9 @@
 [submodule "extern/bam"]
 	path = extern/bam
 	url = https://github.com/ZaidQureshi/bam.git
+[submodule "extern/libnvme"]
+	path = extern/libnvme
+	url = https://github.com/linux-nvme/libnvme.git
+[submodule "extern/nvme-cli"]
+	path = extern/nvme-cli
+	url = https://github.com/linux-nvme/nvme-cli.git
