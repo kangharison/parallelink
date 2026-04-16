@@ -196,11 +196,6 @@ static void handle_admin_client(int cfd)
 			return;
 	}
 
-	if (plink_admin_opcode_blocked(&pcmd)) {
-		rc = EPERM;
-		goto reply;
-	}
-
 	plink_build_sqe(sqe, &pcmd);
 	rc = plink_admin_rpc(sqe, cpl, data, data_len, direction);
 
