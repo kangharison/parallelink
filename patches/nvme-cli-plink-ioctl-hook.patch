@@ -1,0 +1,35 @@
+diff --git a/util/logging.c b/util/logging.c
+index c26d9e22..9dcf21ec 100644
+--- a/util/logging.c
++++ b/util/logging.c
+@@ -12,6 +12,18 @@
+ 
+ #include "logging.h"
+ 
++#ifdef PLINK
++/*
++ * parallelink: redirect admin passthrough ioctls to an out-of-band
++ * Unix-domain socket so an external controller (the parallelink fio
++ * engine) can execute them on this process's behalf. The hook lives
++ * outside the libnvme tree — see src/plink_ioctl_hook.c in the
++ * parallelink repository. Non-admin ioctls pass straight through to
++ * the real ioctl(2) inside the hook.
++ */
++extern int plink_ioctl_hook(int fd, unsigned long ioctl_cmd, void *arg);
++#endif
++
+ int log_level;
+ 
+ int map_log_level(int verbose, bool quiet)
+@@ -95,7 +107,11 @@ int nvme_submit_passthru(int fd, unsigned long ioctl_cmd,
+ 	if (log_level >= LOG_INFO)
+ 		gettimeofday(&start, NULL);
+ 
++#ifdef PLINK
++	err = plink_ioctl_hook(fd, ioctl_cmd, cmd);
++#else
+ 	err = ioctl(fd, ioctl_cmd, cmd);
++#endif
+ 
+ 	if (log_level >= LOG_INFO) {
+ 		gettimeofday(&end, NULL);

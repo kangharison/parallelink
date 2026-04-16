@@ -109,6 +109,17 @@ for LIBNVME_PATCH in "${ROOT}"/patches/libnvme-*.patch; do
     fi
 done
 
+for NVME_CLI_PATCH in "${ROOT}"/patches/nvme-cli-*.patch; do
+    if [[ -f "${NVME_CLI_PATCH}" ]]; then
+        if git -C "${NVME_CLI_DIR}" apply --reverse --check "${NVME_CLI_PATCH}" >/dev/null 2>&1; then
+            echo "==> ${NVME_CLI_PATCH} already applied"
+        else
+            echo "==> Applying ${NVME_CLI_PATCH}"
+            git -C "${NVME_CLI_DIR}" apply "${NVME_CLI_PATCH}"
+        fi
+    fi
+done
+
 # ------------------------------------------------------------------
 # 0. Submodules
 #
@@ -237,6 +248,7 @@ else
     meson configure "${LIBNVME_BUILD}" "${LIBNVME_MESON_ARGS[@]}"
 fi
 ninja -C "${LIBNVME_BUILD}" -j"${JOBS}"
+ninja -C "${LIBNVME_BUILD}" install
 
 # ------------------------------------------------------------------
 # 5. nvme-cli (linked against the PLINK-hooked libnvme)
@@ -265,16 +277,11 @@ export PKG_CONFIG_PATH="${LIBNVME_PC_DIR}:${PKG_CONFIG_PATH:-}"
 # meson-uninstalled dir.
 #
 NVME_CLI_MESON_ARGS=(
+    -Dc_args="-DPLINK"
     -Dbuildtype="${LIBNVME_BUILDTYPE}"
-    -Dc_link_args="-Wl,-rpath,\$ORIGIN"
-    -Dlibnvme=disabled
-    -Dpython=disabled
-    -Dopenssl=disabled
-    -Dlibdbus=disabled
-    -Dkeyutils=disabled
-    -Djson-c=disabled
+    -Dc_link_args="-Wl,-rpath,\$ORIGIN -lm ${PLINK_HOOK_LIB}"
+    -Djson-c=enabled
     -Ddocs=false
-    -Dtests=false
 )
 
 if [[ ! -f "${NVME_CLI_BUILD}/build.ninja" ]]; then
