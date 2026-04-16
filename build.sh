@@ -256,9 +256,18 @@ if [[ ! -d "${LIBNVME_PC_DIR}" ]]; then
 fi
 export PKG_CONFIG_PATH="${LIBNVME_PC_DIR}:${PKG_CONFIG_PATH:-}"
 
+#
+# -Dlibnvme=disabled is critical: nvme-cli vendors libnvme under
+# extern/nvme-cli/libnvme/ and would otherwise build that nested copy,
+# ignoring the PLINK-hooked libnvme we just built at extern/libnvme.
+# Disabling it forces nvme-cli to resolve libnvme via pkg-config —
+# which PKG_CONFIG_PATH above points at our patched build's
+# meson-uninstalled dir.
+#
 NVME_CLI_MESON_ARGS=(
     -Dbuildtype="${LIBNVME_BUILDTYPE}"
     -Dc_link_args="-Wl,-rpath,\$ORIGIN"
+    -Dlibnvme=disabled
     -Dpython=disabled
     -Dopenssl=disabled
     -Dlibdbus=disabled
