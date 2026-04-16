@@ -4,9 +4,6 @@
 [submodule "extern/bam"]
 	path = extern/bam
 	url = https://github.com/ZaidQureshi/bam.git
-[submodule "extern/libnvme"]
-	path = extern/libnvme
-	url = ssh://git@bitbucket.samsungds.net:7999/ssdtp/libnvme_upstream.git
 [submodule "extern/nvme-cli"]
 	path = extern/nvme-cli
 	url = ssh://git@bitbucket.samsungds.net:7999/ssdtp/nvme-cli.git
