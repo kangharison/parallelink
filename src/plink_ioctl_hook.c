@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -193,4 +194,17 @@ int plink_ioctl_hook(int fd, unsigned long ioctl_cmd, void *arg)
 	/* Everything else — I/O passthru, 64-bit variants, reset,
 	 * namespace management, etc. — is not our business. */
 	return ioctl(fd, ioctl_cmd, arg);
+}
+
+extern int __real_ioctl(int fd, unsigned long ioctl_cmd, void *arg);
+
+int __wrap_ioctl(int fd, unsigned long ioctl_cmd, void *arg)
+{
+	printf("__wrap_ioctl()!!!\n");
+	if (ioctl_cmd == NVME_IOCTL_ADMIN_CMD)
+		return forward_admin((struct nvme_passthru_cmd *)arg);
+
+	/* Everything else — I/O passthru, 64-bit variants, reset,
+	 * namespace management, etc. — is not our business. */
+	return __real_ioctl(fd, ioctl_cmd, arg);
 }

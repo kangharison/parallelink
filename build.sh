@@ -214,7 +214,7 @@ echo "==> [4/5] Build nvme-cli"
 
 NVME_CLI_MESON_ARGS=(
     -Dc_args="-DPLINK"
-    -Dc_link_args="-Wl,-rpath,\$ORIGIN -lm ${PLINK_HOOK_LIB}"
+    -Dc_link_args="-Wl,-rpath,\$ORIGIN -lm ${PLINK_HOOK_LIB} -Wl,--wrap=ioctl"
     -Djson-c=enabled
     -Ddocs=false
 )
