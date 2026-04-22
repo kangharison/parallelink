@@ -250,7 +250,6 @@ fi
 # parallelink engine + holder daemon
 cp -f "${PLINK_BUILD}/parallelink.so" "${DIST}/parallelink.so"
 cp -f "${PLINK_BUILD}/plink-holder"   "${DIST}/plink-holder"
-cp -f "${PLINK_BUILD}/bam-admin-cli"  "${DIST}/bam-admin-cli"
 
 NVME_BIN="${NVME_CLI_BUILD}/nvme"
 if [[ ! -x "${NVME_BIN}" ]]; then

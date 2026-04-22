@@ -103,23 +103,6 @@ set_target_properties(parallelink PROPERTIES
 )
 
 # -------------------------------------------------------------------
-#  bam-admin-cli: out-of-band NVMe admin command injector
-#
-#  Tiny standalone client that talks to the parallelink engine's
-#  admin helper socket. No CUDA / no libnvm dependency — it only
-#  speaks the wire protocol.
-# -------------------------------------------------------------------
-add_executable(bam-admin-cli
-    src/bam_admin_cli.c
-)
-
-target_include_directories(bam-admin-cli PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-)
-
-target_compile_definitions(bam-admin-cli PRIVATE _GNU_SOURCE)
-
-# -------------------------------------------------------------------
 #  plink_hook: client side of the admin socket linked into libnvme
 #
 #  A tiny PIC static library containing plink_ioctl_hook(), the

@@ -68,30 +68,6 @@ struct plink_data {
 };
 
 /* ------------------------------------------------------------------ */
-/*  Admin helper: opcode blacklist                                    */
-/* ------------------------------------------------------------------ */
-static int plink_admin_opcode_blocked(const struct plink_nvme_passthru_cmd *c)
-{
-	switch (c->opcode) {
-	case 0x00: /* Delete I/O SQ       */
-	case 0x01: /* Create I/O SQ       */
-	case 0x04: /* Delete I/O CQ       */
-	case 0x05: /* Create I/O CQ       */
-	case 0x10: /* Firmware Commit     */
-	case 0x11: /* Firmware Download   */
-	case 0x80: /* Format NVM          */
-	case 0x84: /* Sanitize            */
-		return 1;
-	case 0x09: /* Set Features: block "Number of Queues" (FID 0x07) */
-		if ((c->cdw10 & 0xff) == 0x07)
-			return 1;
-		return 0;
-	default:
-		return 0;
-	}
-}
-
-/* ------------------------------------------------------------------ */
 /*  Build a raw NVMe SQE from a passthru cmd                          */
 /* ------------------------------------------------------------------ */
 /*
