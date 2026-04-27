@@ -168,13 +168,6 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 		else
 			write_data(pc, qp, start_block, n_blocks_dev, pc_entry);
 
-		/*
-		 * Explicit warp reconverge. Empirically required to avoid a hang
-		 * on Volta+; kept defensively until P0 is verified to render it
-		 * unnecessary on its own.
-		 */
-		__syncwarp();
-
 		ios_done++;
 		pending_done++;
 		lba_512 += lba_step;
@@ -186,6 +179,9 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 				  (unsigned long long)pending_done);
 			pending_done = 0;
 		}
+
+		// Explicit synchronization is required, idk why
+		__syncwarp();
 	}
 
 	if (pending_done)
