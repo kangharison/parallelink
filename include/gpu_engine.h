@@ -36,12 +36,10 @@ struct plink_workload {
 	uint8_t  opcode;          /* PLINK_OP_READ or PLINK_OP_WRITE */
 	int      random;          /* 1=random, 0=sequential */
 	uint32_t block_size;      /* bytes per I/O */
-	uint32_t n_blocks;        /* 512B blocks per I/O */
-	uint64_t lba_range;       /* total 512B LBAs addressable */
+	uint32_t n_blocks;        /* device LBAs per I/O (converted at launch) */
+	uint64_t lba_range;       /* total device LBAs addressable (converted at launch) */
 	uint64_t ios_per_thread;  /* I/Os each GPU thread should issue */
 	int      total_threads;   /* total GPU threads launched */
-	int      record_lat;      /* whether to record per-I/O latency */
-	uint64_t *latencies;      /* device pointer, may be NULL */
 };
 
 /*

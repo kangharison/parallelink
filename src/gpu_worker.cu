@@ -11,7 +11,7 @@
  *   - Workload parameters (`struct plink_workload`) are passed BY VALUE as
  *     a kernel launch argument → parameter buffer → registers. Every field
  *     the I/O loop reads (opcode, ios_per_thread, n_blocks, lba_range,
- *     random, record_lat, latencies*) is in-register; zero memory traffic
+ *     random) is in-register; zero memory traffic
  *     for workload config during the loop.
  *
  *   - The done counter (`d_done_count`) is pure device memory
@@ -92,15 +92,12 @@ static plink_gpu_ctx g_ctx = {};
  * helpers. Those helpers internally build the command, set PRPs from
  * pc->prp1/prp2, do sq_enqueue + cq_poll + cq_dequeue, and release cid.
  *
- * Launch bounds target the same SM-level occupancy as BaM's block
- * benchmark (2048 resident threads/SM) but with a 128-thread block
- * shape: 128 × 16 = 2048. The absolute occupancy target matters more
- * than block shape here because BaM's queue primitives spin on
- * device-wide atomics with __nanosleep backoff — the more warps
- * resident per SM, the better the SM can hide that latency. 128 also
- * lines up cleanly with the (tid/32) % n_queues warp-to-queue mapping.
+ * Launch bounds and block shape match BaM's block benchmark. BaM's queue
+ * primitives spin on device-wide atomics with __nanosleep backoff, so
+ * preserving the same occupancy and scheduling shape keeps comparisons
+ * against block-nvm meaningful.
  */
-__global__ __launch_bounds__(128, 16)
+__global__ __launch_bounds__(64, 32)
 void plink_io_worker(struct plink_ctrl_block *ctrl,
 		     uint64_t *d_done_count,
 		     struct plink_workload wl,
@@ -118,67 +115,67 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	/* Each thread owns one distinct page-cache slot for its in-flight I/O. */
 	uint64_t pc_entry = (uint64_t)tid % pc->n_pages;
 
-	/* I/O granularity in LBAs. wl.n_blocks is in 512B LBAs from the host side
-	 * but BaM read_data/write_data expect it in device block units. */
-	uint32_t lba_shift = qp->block_size_log;
-	uint64_t n_blocks_dev = ((uint64_t)wl.n_blocks * 512ULL) >> lba_shift;
-	if (n_blocks_dev == 0)
-		n_blocks_dev = 1;
-
 	uint64_t lba_max = wl.lba_range;
 
-	uint64_t ios_done = 0;
-	uint64_t seed = tid * 6364136223846793005ULL + 1;
+	uint64_t pending_done = 0;
+	uint64_t slba = tid * (uint64_t)wl.n_blocks;
+	uint64_t lba_step;
+
+	if (wl.random) {
+		/* PoC pseudo-random walk: each thread gets a tid-derived odd
+		 * stride. It avoids per-I/O division/modulo and is only meant to
+		 * scatter traffic enough for randread-style experiments. */
+		lba_step = ((tid * 1315423911ULL) | 1ULL) *
+			   (uint64_t)wl.n_blocks;
+	} else {
+		lba_step = (uint64_t)wl.total_threads *
+			   (uint64_t)wl.n_blocks;
+	}
+
+	if (lba_max) {
+		if (slba + wl.n_blocks >= lba_max)
+			slba -= (slba / lba_max) * lba_max;
+		if (lba_step >= lba_max)
+			lba_step -= (lba_step / lba_max) * lba_max;
+		if (lba_step == 0)
+			lba_step = wl.n_blocks ? wl.n_blocks : 1;
+	}
 
 	/*
 	 * The kernel runs until the CPU signals shutdown. fio's keep_running()
 	 * decides when the job ends and then plink_gpu_shutdown() writes the
 	 * pinned ctrl flag. Each shutdown read is a PCIe round-trip to host
-	 * memory, so we amortize by polling once every 64 I/Os — at BaM I/O
-	 * rates the added latency is well under 10ns/iter.
+	 * memory, so we amortize by polling once every 1024 I/Os.
 	 */
 	while (true) {
-		if ((ios_done & 63) == 0) {
+		if ((pending_done & 1023ULL) == 0) {
 			if (ctrl->shutdown)
 				break;
 		}
 
-		uint64_t lba_512;
-		if (wl.random) {
-			seed ^= seed << 13;
-			seed ^= seed >> 7;
-			seed ^= seed << 17;
-			lba_512 = seed % lba_max;
-		} else {
-			lba_512 = (tid * wl.ios_per_thread + ios_done)
-				  * wl.n_blocks;
-			if (lba_max)
-				lba_512 %= lba_max;
-		}
-		uint64_t start_block = (lba_512 * 512ULL) >> lba_shift;
-
-		uint64_t t_start = clock64();
-
 		if (wl.opcode == PLINK_OP_READ)
-			read_data(pc, qp, start_block, n_blocks_dev, pc_entry);
+			read_data(pc, qp, slba, wl.n_blocks, pc_entry);
 		else
-			write_data(pc, qp, start_block, n_blocks_dev, pc_entry);
+			write_data(pc, qp, slba, wl.n_blocks, pc_entry);
 
-		uint64_t t_end = clock64();
+		pending_done++;
+		slba += lba_step;
+		if (lba_max && slba >= lba_max)
+			slba -= lba_max;
 
-		/*
-		 * Explicit warp reconverge. Empirically required to avoid a hang
-		 * on Volta+; kept defensively until P0 is verified to render it
-		 * unnecessary on its own.
-		 */
+		if ((pending_done & 1023ULL) == 0) {
+			atomicAdd((unsigned long long *)d_done_count,
+				  (unsigned long long)pending_done);
+			pending_done = 0;
+		}
+
+		// Explicit synchronization is required, idk why
 		__syncwarp();
-
-		if (wl.record_lat && wl.latencies)
-			wl.latencies[tid] = t_end - t_start;
-
-		atomicAdd((unsigned long long *)d_done_count, 1ULL);
-		ios_done++;
 	}
+
+	if (pending_done)
+		atomicAdd((unsigned long long *)d_done_count,
+			  (unsigned long long)pending_done);
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,29 +318,22 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 	g_ctx.gpu_warps     = gpu_warps;
 	g_ctx.total_threads = gpu_warps * 32;
 
-	/* Make a local, mutable copy so we can fix up latencies* if needed. */
 	struct plink_workload wl = *wl_in;
 	wl.total_threads = g_ctx.total_threads;
 
-	/* Allocate per-thread latency buffer in pure device memory if
-	 * requested. Previously this was cudaMallocManaged, which reintroduced
-	 * the same unified-memory thrash we just eliminated for shared state. */
-	if (wl.record_lat && !wl.latencies) {
-		uint64_t *d_lat = nullptr;
-		cudaError_t err = cudaMalloc(&d_lat,
-			sizeof(uint64_t) * g_ctx.total_threads);
-		if (err != cudaSuccess) {
-			fprintf(stderr,
-				"parallelink: latency buffer alloc failed: %s\n",
-				cudaGetErrorString(err));
-			return -1;
-		}
-		cudaMemset(d_lat, 0,
-			sizeof(uint64_t) * g_ctx.total_threads);
-		wl.latencies = d_lat;
+	/* Convert 512B-based host values to device-LBA units so the GPU
+	 * kernel works directly in device blocks with no per-I/O shift. */
+	uint32_t lba_size = (uint32_t)g_ctx.ctrl->ns.lba_data_size;
+	wl.n_blocks  = (uint32_t)((uint64_t)wl.n_blocks * 512ULL / lba_size);
+	if (wl.n_blocks == 0)
+		wl.n_blocks = 1;
+	if (wl.lba_range) {
+		wl.lba_range = wl.lba_range * 512ULL / lba_size;
+		if (wl.lba_range == 0)
+			wl.lba_range = 1;
 	}
 
-	const int threads_per_block = 128;
+	const int threads_per_block = 64;
 	int blocks = (g_ctx.total_threads + threads_per_block - 1)
 		     / threads_per_block;
 

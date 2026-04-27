@@ -214,7 +214,7 @@ echo "==> [4/5] Build nvme-cli"
 
 NVME_CLI_MESON_ARGS=(
     -Dc_args="-DPLINK"
-    -Dc_link_args="-Wl,-rpath,\$ORIGIN -lm ${PLINK_HOOK_LIB}"
+    -Dc_link_args="-Wl,-rpath,\$ORIGIN -lm ${PLINK_HOOK_LIB} -Wl,--wrap=ioctl"
     -Djson-c=enabled
     -Ddocs=false
 )
@@ -250,7 +250,6 @@ fi
 # parallelink engine + holder daemon
 cp -f "${PLINK_BUILD}/parallelink.so" "${DIST}/parallelink.so"
 cp -f "${PLINK_BUILD}/plink-holder"   "${DIST}/plink-holder"
-cp -f "${PLINK_BUILD}/bam-admin-cli"  "${DIST}/bam-admin-cli"
 
 NVME_BIN="${NVME_CLI_BUILD}/nvme"
 if [[ ! -x "${NVME_BIN}" ]]; then

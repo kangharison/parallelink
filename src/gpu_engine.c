@@ -39,6 +39,7 @@ struct plink_options {
 	unsigned int gpu_warps;
 	unsigned int gpu_id;
 	unsigned int n_queues;
+	unsigned int queue_depth;
 	char        *nvme_dev;
 };
 
@@ -66,30 +67,6 @@ struct plink_data {
 	volatile int  admin_run;
 	int           admin_enabled;
 };
-
-/* ------------------------------------------------------------------ */
-/*  Admin helper: opcode blacklist                                    */
-/* ------------------------------------------------------------------ */
-static int plink_admin_opcode_blocked(const struct plink_nvme_passthru_cmd *c)
-{
-	switch (c->opcode) {
-	case 0x00: /* Delete I/O SQ       */
-	case 0x01: /* Create I/O SQ       */
-	case 0x04: /* Delete I/O CQ       */
-	case 0x05: /* Create I/O CQ       */
-	case 0x10: /* Firmware Commit     */
-	case 0x11: /* Firmware Download   */
-	case 0x80: /* Format NVM          */
-	case 0x84: /* Sanitize            */
-		return 1;
-	case 0x09: /* Set Features: block "Number of Queues" (FID 0x07) */
-		if ((c->cdw10 & 0xff) == 0x07)
-			return 1;
-		return 0;
-	default:
-		return 0;
-	}
-}
 
 /* ------------------------------------------------------------------ */
 /*  Build a raw NVMe SQE from a passthru cmd                          */
@@ -346,6 +323,16 @@ static struct fio_option options[] = {
 		.group    = FIO_OPT_G_INVALID,
 	},
 	{
+		.name     = "queue_depth",
+		.lname    = "NVMe queue depth",
+		.type     = FIO_OPT_INT,
+		.off1     = offsetof(struct plink_options, queue_depth),
+		.def      = "16",
+		.help     = "Depth of each NVMe submission/completion queue",
+		.category = FIO_OPT_C_ENGINE,
+		.group    = FIO_OPT_G_INVALID,
+	},
+	{
 		.name     = "nvme_dev",
 		.lname    = "libnvm device path",
 		.type     = FIO_OPT_STR_STORE,
@@ -417,7 +404,7 @@ static int fio_plink_init(struct thread_data *td)
 	pd->admin_enabled   = 0;
 
 	ret = plink_gpu_init(&pd->state, o->gpu_id, o->nvme_dev,
-			     o->n_queues, 256);
+			     o->n_queues, o->queue_depth);
 	if (ret) {
 		log_err("parallelink: GPU init failed (ret=%d). "
 			"Is libnvm loaded? (insmod libnvm.ko)\n", ret);
@@ -438,8 +425,6 @@ static int fio_plink_init(struct thread_data *td)
 	pd->wl.opcode       = td_read(td) ? PLINK_OP_READ : PLINK_OP_WRITE;
 	pd->wl.random       = td_random(td);
 	pd->wl.lba_range    = td->o.size / 512;
-	pd->wl.record_lat   = 0;
-	pd->wl.latencies    = NULL;
 	pd->last_seen       = 0;
 
 	int total_threads       = o->gpu_warps * 32;
@@ -497,8 +482,8 @@ static int fio_plink_commit(struct thread_data *td)
 
 /*
  * getevents(): poll the GPU's done_count to harvest completions.
- * This is how fio collects BW/IOPS/latency statistics from the
- * GPU-driven I/O loop.
+ * This is how fio collects BW/IOPS statistics from the GPU-driven
+ * I/O loop.
  */
 static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 			       unsigned int max, const struct timespec *t)
@@ -536,9 +521,9 @@ static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 			events = (unsigned int)new_events;
 			break;
 		}
-		/* 100 µs backoff — fio stats resolution is ms, so this is
+		/* 1 ms backoff — fio stats resolution is ms, so this is
 		 * plenty, and it keeps CPU-side pressure off the side stream. */
-		usleep(100);
+		usleep(1000);
 	}
 
 	return (int)events;
