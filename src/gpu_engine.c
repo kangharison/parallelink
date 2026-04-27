@@ -22,6 +22,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <poll.h>
 
 #include "config-host.h"
 #include "fio.h"
@@ -64,6 +65,7 @@ struct plink_data {
 	/* Admin command injection helper thread. */
 	pthread_t     admin_thr;
 	int           admin_listen_fd;
+	int           admin_wake_fd[2];
 	volatile int  admin_run;
 	int           admin_enabled;
 };
@@ -104,31 +106,61 @@ static void plink_build_sqe(uint8_t sqe[PLINK_ADMIN_CMD_LEN],
 /* ------------------------------------------------------------------ */
 /*  Admin helper: I/O utilities                                       */
 /* ------------------------------------------------------------------ */
-static int read_full(int fd, void *buf, size_t n)
+static void close_if_open(int *fd)
+{
+	if (*fd >= 0) {
+		close(*fd);
+		*fd = -1;
+	}
+}
+
+static int set_nonblock(int fd)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
+
+	if (flags < 0)
+		return -1;
+	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int wait_fd_ready(int fd, short events, volatile int *run)
+{
+	while (__atomic_load_n(run, __ATOMIC_ACQUIRE)) {
+		struct pollfd pfd = {
+			.fd = fd,
+			.events = events,
+			.revents = 0,
+		};
+		int ret = poll(&pfd, 1, 250);
+
+		if (ret > 0) {
+			if (pfd.revents & (events | POLLERR | POLLHUP | POLLNVAL))
+				return 0;
+			continue;
+		}
+		if (ret == 0)
+			continue;
+		if (errno == EINTR)
+			continue;
+		return -1;
+	}
+	return -1;
+}
+
+static int read_full(volatile int *run, int fd, void *buf, size_t n)
 {
 	uint8_t *p = buf;
 	while (n) {
+		if (wait_fd_ready(fd, POLLIN, run) < 0)
+			return -1;
+
 		ssize_t r = read(fd, p, n);
 		if (r == 0)
 			return -1;
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
-			return -1;
-		}
-		p += r;
-		n -= (size_t)r;
-	}
-	return 0;
-}
-
-static int write_full(int fd, const void *buf, size_t n)
-{
-	const uint8_t *p = buf;
-	while (n) {
-		ssize_t r = write(fd, p, n);
-		if (r < 0) {
-			if (errno == EINTR)
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			return -1;
 		}
@@ -138,7 +170,30 @@ static int write_full(int fd, const void *buf, size_t n)
 	return 0;
 }
 
-static void handle_admin_client(int cfd)
+static int write_full(volatile int *run, int fd, const void *buf, size_t n)
+{
+	const uint8_t *p = buf;
+	while (n) {
+		if (wait_fd_ready(fd, POLLOUT, run) < 0)
+			return -1;
+
+		ssize_t r = write(fd, p, n);
+		if (r == 0)
+			return -1;
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			return -1;
+		}
+		p += r;
+		n -= (size_t)r;
+	}
+	return 0;
+}
+
+static void handle_admin_client(struct plink_data *pd, int cfd)
 {
 	struct plink_nvme_passthru_cmd pcmd;
 	uint8_t  sqe[PLINK_ADMIN_CMD_LEN];
@@ -151,7 +206,7 @@ static void handle_admin_client(int cfd)
 
 	memset(cpl, 0, sizeof(cpl));
 
-	if (read_full(cfd, &pcmd, sizeof(pcmd)) < 0)
+	if (read_full(&pd->admin_run, cfd, &pcmd, sizeof(pcmd)) < 0)
 		return;
 
 	data_len  = pcmd.data_len;
@@ -169,7 +224,7 @@ static void handle_admin_client(int cfd)
 	}
 
 	if (direction == PLINK_DIR_H2D && data_len) {
-		if (read_full(cfd, data, data_len) < 0)
+		if (read_full(&pd->admin_run, cfd, data, data_len) < 0)
 			return;
 	}
 
@@ -181,12 +236,12 @@ static void handle_admin_client(int cfd)
 		memcpy(&result, cpl, sizeof(result));
 
 reply:
-	if (write_full(cfd, &rc, sizeof(rc)) < 0)
+	if (write_full(&pd->admin_run, cfd, &rc, sizeof(rc)) < 0)
 		return;
-	if (write_full(cfd, &result, sizeof(result)) < 0)
+	if (write_full(&pd->admin_run, cfd, &result, sizeof(result)) < 0)
 		return;
 	if (rc == 0 && direction == PLINK_DIR_D2H && data_len)
-		write_full(cfd, data, data_len);
+		write_full(&pd->admin_run, cfd, data, data_len);
 }
 
 static void *plink_admin_thread(void *arg)
@@ -194,14 +249,35 @@ static void *plink_admin_thread(void *arg)
 	struct plink_data *pd = arg;
 
 	while (__atomic_load_n(&pd->admin_run, __ATOMIC_ACQUIRE)) {
-		int cfd = accept(pd->admin_listen_fd, NULL, NULL);
-		if (cfd < 0) {
+		struct pollfd pfds[2] = {
+			{ .fd = pd->admin_listen_fd, .events = POLLIN },
+			{ .fd = pd->admin_wake_fd[0], .events = POLLIN },
+		};
+		int ret = poll(pfds, 2, -1);
+
+		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
-		handle_admin_client(cfd);
-		close(cfd);
+		if (pfds[1].revents)
+			break;
+		if (!(pfds[0].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
+			continue;
+
+		while (__atomic_load_n(&pd->admin_run, __ATOMIC_ACQUIRE)) {
+			int cfd = accept(pd->admin_listen_fd, NULL, NULL);
+			if (cfd < 0) {
+				if (errno == EINTR)
+					continue;
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+				return NULL;
+			}
+			(void)set_nonblock(cfd);
+			handle_admin_client(pd, cfd);
+			close(cfd);
+		}
 	}
 	return NULL;
 }
@@ -222,6 +298,13 @@ static int plink_admin_start(struct plink_data *pd)
 	if (fd < 0) {
 		log_err("parallelink: admin socket() failed: %s\n",
 			strerror(errno));
+		plink_admin_teardown();
+		return -1;
+	}
+	if (set_nonblock(fd) < 0) {
+		log_err("parallelink: admin socket nonblock failed: %s\n",
+			strerror(errno));
+		close(fd);
 		plink_admin_teardown();
 		return -1;
 	}
@@ -248,11 +331,34 @@ static int plink_admin_start(struct plink_data *pd)
 	}
 
 	pd->admin_listen_fd = fd;
+	pd->admin_wake_fd[0] = -1;
+	pd->admin_wake_fd[1] = -1;
+	if (pipe(pd->admin_wake_fd) < 0) {
+		log_err("parallelink: admin wake pipe failed: %s\n",
+			strerror(errno));
+		close(fd);
+		unlink(PLINK_ADMIN_SOCKET_PATH);
+		plink_admin_teardown();
+		return -1;
+	}
+	if (set_nonblock(pd->admin_wake_fd[0]) < 0 ||
+	    set_nonblock(pd->admin_wake_fd[1]) < 0) {
+		log_err("parallelink: admin wake pipe nonblock failed: %s\n",
+			strerror(errno));
+		close_if_open(&pd->admin_wake_fd[0]);
+		close_if_open(&pd->admin_wake_fd[1]);
+		close(fd);
+		unlink(PLINK_ADMIN_SOCKET_PATH);
+		plink_admin_teardown();
+		return -1;
+	}
 	pd->admin_run       = 1;
 
 	if (pthread_create(&pd->admin_thr, NULL,
 			   plink_admin_thread, pd) != 0) {
 		log_err("parallelink: pthread_create(admin) failed\n");
+		close_if_open(&pd->admin_wake_fd[0]);
+		close_if_open(&pd->admin_wake_fd[1]);
 		close(fd);
 		unlink(PLINK_ADMIN_SOCKET_PATH);
 		plink_admin_teardown();
@@ -272,16 +378,16 @@ static void plink_admin_stop(struct plink_data *pd)
 
 	__atomic_store_n(&pd->admin_run, 0, __ATOMIC_RELEASE);
 
-	/*
-	 * Unblock accept() by shutting down the listen socket. The helper
-	 * thread sees run==0 next iteration and bails.
-	 */
-	if (pd->admin_listen_fd >= 0) {
-		shutdown(pd->admin_listen_fd, SHUT_RDWR);
-		close(pd->admin_listen_fd);
-		pd->admin_listen_fd = -1;
+	/* Wake the helper explicitly. Closing a listening socket from another
+	 * thread is not a reliable way to interrupt a blocking accept(). */
+	if (pd->admin_wake_fd[1] >= 0) {
+		uint8_t byte = 1;
+		(void)write(pd->admin_wake_fd[1], &byte, sizeof(byte));
 	}
 	pthread_join(pd->admin_thr, NULL);
+	close_if_open(&pd->admin_listen_fd);
+	close_if_open(&pd->admin_wake_fd[0]);
+	close_if_open(&pd->admin_wake_fd[1]);
 	unlink(PLINK_ADMIN_SOCKET_PATH);
 	plink_admin_teardown();
 	pd->admin_enabled = 0;
@@ -400,6 +506,8 @@ static int fio_plink_init(struct thread_data *td)
 		return -ENOMEM;
 	}
 	pd->admin_listen_fd = -1;
+	pd->admin_wake_fd[0] = -1;
+	pd->admin_wake_fd[1] = -1;
 	pd->admin_run       = 0;
 	pd->admin_enabled   = 0;
 
