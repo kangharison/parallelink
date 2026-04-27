@@ -115,17 +115,10 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	/* Each thread owns one distinct page-cache slot for its in-flight I/O. */
 	uint64_t pc_entry = (uint64_t)tid % pc->n_pages;
 
-	/* I/O granularity in LBAs. wl.n_blocks is in 512B LBAs from the host side
-	 * but BaM read_data/write_data expect it in device block units. */
-	uint32_t lba_shift = qp->block_size_log;
-	uint64_t n_blocks_dev = ((uint64_t)wl.n_blocks * 512ULL) >> lba_shift;
-	if (n_blocks_dev == 0)
-		n_blocks_dev = 1;
-
 	uint64_t lba_max = wl.lba_range;
 
 	uint64_t pending_done = 0;
-	uint64_t lba_512 = tid * (uint64_t)wl.n_blocks;
+	uint64_t slba = tid * (uint64_t)wl.n_blocks;
 	uint64_t lba_step;
 
 	if (wl.random) {
@@ -140,8 +133,8 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	}
 
 	if (lba_max) {
-		if (lba_512 >= lba_max)
-			lba_512 -= (lba_512 / lba_max) * lba_max;
+		if (slba + wl.n_blocks >= lba_max)
+			slba -= (slba / lba_max) * lba_max;
 		if (lba_step >= lba_max)
 			lba_step -= (lba_step / lba_max) * lba_max;
 		if (lba_step == 0)
@@ -160,17 +153,15 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 				break;
 		}
 
-		uint64_t start_block = (lba_512 * 512ULL) >> lba_shift;
-
 		if (wl.opcode == PLINK_OP_READ)
-			read_data(pc, qp, start_block, n_blocks_dev, pc_entry);
+			read_data(pc, qp, slba, wl.n_blocks, pc_entry);
 		else
-			write_data(pc, qp, start_block, n_blocks_dev, pc_entry);
+			write_data(pc, qp, slba, wl.n_blocks, pc_entry);
 
 		pending_done++;
-		lba_512 += lba_step;
-		if (lba_max && lba_512 >= lba_max)
-			lba_512 -= lba_max;
+		slba += lba_step;
+		if (lba_max && slba >= lba_max)
+			slba -= lba_max;
 
 		if ((pending_done & 1023ULL) == 0) {
 			atomicAdd((unsigned long long *)d_done_count,
@@ -329,6 +320,18 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 
 	struct plink_workload wl = *wl_in;
 	wl.total_threads = g_ctx.total_threads;
+
+	/* Convert 512B-based host values to device-LBA units so the GPU
+	 * kernel works directly in device blocks with no per-I/O shift. */
+	uint32_t lba_size = (uint32_t)g_ctx.ctrl->ns.lba_data_size;
+	wl.n_blocks  = (uint32_t)((uint64_t)wl.n_blocks * 512ULL / lba_size);
+	if (wl.n_blocks == 0)
+		wl.n_blocks = 1;
+	if (wl.lba_range) {
+		wl.lba_range = wl.lba_range * 512ULL / lba_size;
+		if (wl.lba_range == 0)
+			wl.lba_range = 1;
+	}
 
 	const int threads_per_block = 64;
 	int blocks = (g_ctx.total_threads + threads_per_block - 1)
