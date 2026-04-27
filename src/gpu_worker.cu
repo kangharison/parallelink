@@ -124,7 +124,6 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 
 	uint64_t lba_max = wl.lba_range;
 
-	uint64_t ios_done = 0;
 	uint64_t pending_done = 0;
 	uint64_t lba_512 = tid * (uint64_t)wl.n_blocks;
 	uint64_t lba_step;
@@ -156,7 +155,7 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	 * memory, so we amortize by polling once every 1024 I/Os.
 	 */
 	while (true) {
-		if ((ios_done & 1023ULL) == 0) {
+		if ((pending_done & 1023ULL) == 0) {
 			if (ctrl->shutdown)
 				break;
 		}
@@ -168,7 +167,6 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 		else
 			write_data(pc, qp, start_block, n_blocks_dev, pc_entry);
 
-		ios_done++;
 		pending_done++;
 		lba_512 += lba_step;
 		if (lba_max && lba_512 >= lba_max)
