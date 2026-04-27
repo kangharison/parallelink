@@ -414,8 +414,6 @@ static int fio_plink_init(struct thread_data *td)
 	pd->wl.opcode       = td_read(td) ? PLINK_OP_READ : PLINK_OP_WRITE;
 	pd->wl.random       = td_random(td);
 	pd->wl.lba_range    = td->o.size / 512;
-	pd->wl.record_lat   = 0;
-	pd->wl.latencies    = NULL;
 	pd->last_seen       = 0;
 
 	int total_threads       = o->gpu_warps * 32;
@@ -473,8 +471,8 @@ static int fio_plink_commit(struct thread_data *td)
 
 /*
  * getevents(): poll the GPU's done_count to harvest completions.
- * This is how fio collects BW/IOPS/latency statistics from the
- * GPU-driven I/O loop.
+ * This is how fio collects BW/IOPS statistics from the GPU-driven
+ * I/O loop.
  */
 static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 			       unsigned int max, const struct timespec *t)

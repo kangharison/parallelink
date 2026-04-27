@@ -40,8 +40,6 @@ struct plink_workload {
 	uint64_t lba_range;       /* total 512B LBAs addressable */
 	uint64_t ios_per_thread;  /* I/Os each GPU thread should issue */
 	int      total_threads;   /* total GPU threads launched */
-	int      record_lat;      /* whether to record per-I/O latency */
-	uint64_t *latencies;      /* device pointer, may be NULL */
 };
 
 /*

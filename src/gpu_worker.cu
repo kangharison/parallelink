@@ -11,7 +11,7 @@
  *   - Workload parameters (`struct plink_workload`) are passed BY VALUE as
  *     a kernel launch argument → parameter buffer → registers. Every field
  *     the I/O loop reads (opcode, ios_per_thread, n_blocks, lba_range,
- *     random, record_lat, latencies*) is in-register; zero memory traffic
+ *     random) is in-register; zero memory traffic
  *     for workload config during the loop.
  *
  *   - The done counter (`d_done_count`) is pure device memory
@@ -128,6 +128,7 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	uint64_t lba_max = wl.lba_range;
 
 	uint64_t ios_done = 0;
+	uint64_t pending_done = 0;
 	uint64_t seed = tid * 6364136223846793005ULL + 1;
 
 	/*
@@ -157,14 +158,10 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 		}
 		uint64_t start_block = (lba_512 * 512ULL) >> lba_shift;
 
-		uint64_t t_start = clock64();
-
 		if (wl.opcode == PLINK_OP_READ)
 			read_data(pc, qp, start_block, n_blocks_dev, pc_entry);
 		else
 			write_data(pc, qp, start_block, n_blocks_dev, pc_entry);
-
-		uint64_t t_end = clock64();
 
 		/*
 		 * Explicit warp reconverge. Empirically required to avoid a hang
@@ -173,12 +170,19 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 		 */
 		__syncwarp();
 
-		if (wl.record_lat && wl.latencies)
-			wl.latencies[tid] = t_end - t_start;
-
-		atomicAdd((unsigned long long *)d_done_count, 1ULL);
 		ios_done++;
+		pending_done++;
+
+		if ((pending_done & 1023ULL) == 0) {
+			atomicAdd((unsigned long long *)d_done_count,
+				  (unsigned long long)pending_done);
+			pending_done = 0;
+		}
 	}
+
+	if (pending_done)
+		atomicAdd((unsigned long long *)d_done_count,
+			  (unsigned long long)pending_done);
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,27 +325,8 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 	g_ctx.gpu_warps     = gpu_warps;
 	g_ctx.total_threads = gpu_warps * 32;
 
-	/* Make a local, mutable copy so we can fix up latencies* if needed. */
 	struct plink_workload wl = *wl_in;
 	wl.total_threads = g_ctx.total_threads;
-
-	/* Allocate per-thread latency buffer in pure device memory if
-	 * requested. Previously this was cudaMallocManaged, which reintroduced
-	 * the same unified-memory thrash we just eliminated for shared state. */
-	if (wl.record_lat && !wl.latencies) {
-		uint64_t *d_lat = nullptr;
-		cudaError_t err = cudaMalloc(&d_lat,
-			sizeof(uint64_t) * g_ctx.total_threads);
-		if (err != cudaSuccess) {
-			fprintf(stderr,
-				"parallelink: latency buffer alloc failed: %s\n",
-				cudaGetErrorString(err));
-			return -1;
-		}
-		cudaMemset(d_lat, 0,
-			sizeof(uint64_t) * g_ctx.total_threads);
-		wl.latencies = d_lat;
-	}
 
 	const int threads_per_block = 128;
 	int blocks = (g_ctx.total_threads + threads_per_block - 1)
