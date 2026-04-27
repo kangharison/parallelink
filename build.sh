@@ -247,9 +247,8 @@ else
     echo "WARN: libnvm.ko not found — kernel headers may be missing" >&2
 fi
 
-# parallelink engine + holder daemon
+# parallelink engine
 cp -f "${PLINK_BUILD}/parallelink.so" "${DIST}/parallelink.so"
-cp -f "${PLINK_BUILD}/plink-holder"   "${DIST}/plink-holder"
 
 NVME_BIN="${NVME_CLI_BUILD}/nvme"
 if [[ ! -x "${NVME_BIN}" ]]; then

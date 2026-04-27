@@ -6,7 +6,6 @@
 #define PLINK_MAX_QUEUE_DEPTH 1024
 #define PLINK_MAX_QPS         64
 #define PLINK_STATE_MAGIC     0xBA3D5A7E
-#define PLINK_STATE_PATH      "/tmp/plink_fio_state"
 
 /* I/O direction (NVMe opcodes) */
 #define PLINK_OP_READ         0x02

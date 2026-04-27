@@ -67,7 +67,6 @@ make -j$(nproc)
 
 빌드 산출물:
 - `parallelink.so` : fio external ioengine
-- `plink-holder` : GPU 메모리 상주 데몬
 
 ## Usage
 
@@ -82,14 +81,6 @@ echo "0000:xx:xx.x" > /sys/bus/pci/drivers/libnvm/bind
 
 # /dev/libnvm0 캐릭터 디바이스 생성 확인
 ls -l /dev/libnvm*
-```
-
-### (선택) Holder 데몬 실행
-
-반복 테스트 시 NVMe 컨트롤러 리셋 비용을 제거합니다.
-
-```bash
-./plink-holder --nvme=/dev/libnvm0 --gpu=0 --queues=32
 ```
 
 ### fio 실행
@@ -156,8 +147,7 @@ parallelink/
 │   └── gpu_engine.h      CPU-GPU 공유 구조체 및 인터페이스
 ├── src/
 │   ├── gpu_engine.c      fio ioengine_ops 구현
-│   ├── gpu_worker.cu     GPU persistent kernel
-│   └── holder.cu         GPU 메모리 상주 데몬
+│   └── gpu_worker.cu     GPU persistent kernel
 └── CMakeLists.txt
 ```
 

@@ -124,19 +124,3 @@ target_compile_definitions(plink_hook PRIVATE _GNU_SOURCE)
 set_target_properties(plink_hook PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
-
-# -------------------------------------------------------------------
-#  Holder daemon (keeps GPU memory alive across fio runs)
-# -------------------------------------------------------------------
-add_executable(plink-holder
-    src/holder.cu
-)
-
-target_include_directories(plink-holder PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${LIBNVM_INCLUDE_DIRS}
-)
-
-target_link_libraries(plink-holder PRIVATE
-    CUDA::cudart
-)

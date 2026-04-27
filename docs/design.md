@@ -1,7 +1,7 @@
 # parallelink design
 
 이 문서는 현재 코드 기준의 설계 문서다. 오래된 구현 명세에 있던
-`cudaMallocManaged()` hot path, GPU deadline timer, holder daemon 기반 IPC는
+`cudaMallocManaged()` hot path, GPU deadline timer, resident daemon 기반 IPC는
 현재 설계가 아니다.
 
 ## Goal
@@ -35,8 +35,7 @@ parallelink/
 └── patches/                  # local patches applied by build.sh
 ```
 
-`plink-holder`는 현재 data path에 참여하지 않는다. GPU/NVMe state는 fio engine
-인스턴스가 직접 소유하고 `cleanup()`에서 해제한다.
+GPU/NVMe state는 fio engine 인스턴스가 직접 소유하고 `cleanup()`에서 해제한다.
 
 ## Build Artifacts
 
