@@ -92,15 +92,12 @@ static plink_gpu_ctx g_ctx = {};
  * helpers. Those helpers internally build the command, set PRPs from
  * pc->prp1/prp2, do sq_enqueue + cq_poll + cq_dequeue, and release cid.
  *
- * Launch bounds target the same SM-level occupancy as BaM's block
- * benchmark (2048 resident threads/SM) but with a 128-thread block
- * shape: 128 × 16 = 2048. The absolute occupancy target matters more
- * than block shape here because BaM's queue primitives spin on
- * device-wide atomics with __nanosleep backoff — the more warps
- * resident per SM, the better the SM can hide that latency. 128 also
- * lines up cleanly with the (tid/32) % n_queues warp-to-queue mapping.
+ * Launch bounds and block shape match BaM's block benchmark. BaM's queue
+ * primitives spin on device-wide atomics with __nanosleep backoff, so
+ * preserving the same occupancy and scheduling shape keeps comparisons
+ * against block-nvm meaningful.
  */
-__global__ __launch_bounds__(128, 16)
+__global__ __launch_bounds__(64, 32)
 void plink_io_worker(struct plink_ctrl_block *ctrl,
 		     uint64_t *d_done_count,
 		     struct plink_workload wl,
@@ -129,33 +126,41 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 
 	uint64_t ios_done = 0;
 	uint64_t pending_done = 0;
-	uint64_t seed = tid * 6364136223846793005ULL + 1;
+	uint64_t lba_512 = tid * (uint64_t)wl.n_blocks;
+	uint64_t lba_step;
+
+	if (wl.random) {
+		/* PoC pseudo-random walk: each thread gets a tid-derived odd
+		 * stride. It avoids per-I/O division/modulo and is only meant to
+		 * scatter traffic enough for randread-style experiments. */
+		lba_step = ((tid * 1315423911ULL) | 1ULL) *
+			   (uint64_t)wl.n_blocks;
+	} else {
+		lba_step = (uint64_t)wl.total_threads *
+			   (uint64_t)wl.n_blocks;
+	}
+
+	if (lba_max) {
+		if (lba_512 >= lba_max)
+			lba_512 -= (lba_512 / lba_max) * lba_max;
+		if (lba_step >= lba_max)
+			lba_step -= (lba_step / lba_max) * lba_max;
+		if (lba_step == 0)
+			lba_step = wl.n_blocks ? wl.n_blocks : 1;
+	}
 
 	/*
 	 * The kernel runs until the CPU signals shutdown. fio's keep_running()
 	 * decides when the job ends and then plink_gpu_shutdown() writes the
 	 * pinned ctrl flag. Each shutdown read is a PCIe round-trip to host
-	 * memory, so we amortize by polling once every 64 I/Os — at BaM I/O
-	 * rates the added latency is well under 10ns/iter.
+	 * memory, so we amortize by polling once every 1024 I/Os.
 	 */
 	while (true) {
-		if ((ios_done & 63) == 0) {
+		if ((ios_done & 1023ULL) == 0) {
 			if (ctrl->shutdown)
 				break;
 		}
 
-		uint64_t lba_512;
-		if (wl.random) {
-			seed ^= seed << 13;
-			seed ^= seed >> 7;
-			seed ^= seed << 17;
-			lba_512 = seed % lba_max;
-		} else {
-			lba_512 = (tid * wl.ios_per_thread + ios_done)
-				  * wl.n_blocks;
-			if (lba_max)
-				lba_512 %= lba_max;
-		}
 		uint64_t start_block = (lba_512 * 512ULL) >> lba_shift;
 
 		if (wl.opcode == PLINK_OP_READ)
@@ -172,6 +177,9 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 
 		ios_done++;
 		pending_done++;
+		lba_512 += lba_step;
+		if (lba_max && lba_512 >= lba_max)
+			lba_512 -= lba_max;
 
 		if ((pending_done & 1023ULL) == 0) {
 			atomicAdd((unsigned long long *)d_done_count,
@@ -328,7 +336,7 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 	struct plink_workload wl = *wl_in;
 	wl.total_threads = g_ctx.total_threads;
 
-	const int threads_per_block = 128;
+	const int threads_per_block = 64;
 	int blocks = (g_ctx.total_threads + threads_per_block - 1)
 		     / threads_per_block;
 

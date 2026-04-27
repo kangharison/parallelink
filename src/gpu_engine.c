@@ -39,6 +39,7 @@ struct plink_options {
 	unsigned int gpu_warps;
 	unsigned int gpu_id;
 	unsigned int n_queues;
+	unsigned int queue_depth;
 	char        *nvme_dev;
 };
 
@@ -322,6 +323,16 @@ static struct fio_option options[] = {
 		.group    = FIO_OPT_G_INVALID,
 	},
 	{
+		.name     = "queue_depth",
+		.lname    = "NVMe queue depth",
+		.type     = FIO_OPT_INT,
+		.off1     = offsetof(struct plink_options, queue_depth),
+		.def      = "16",
+		.help     = "Depth of each NVMe submission/completion queue",
+		.category = FIO_OPT_C_ENGINE,
+		.group    = FIO_OPT_G_INVALID,
+	},
+	{
 		.name     = "nvme_dev",
 		.lname    = "libnvm device path",
 		.type     = FIO_OPT_STR_STORE,
@@ -393,7 +404,7 @@ static int fio_plink_init(struct thread_data *td)
 	pd->admin_enabled   = 0;
 
 	ret = plink_gpu_init(&pd->state, o->gpu_id, o->nvme_dev,
-			     o->n_queues, 256);
+			     o->n_queues, o->queue_depth);
 	if (ret) {
 		log_err("parallelink: GPU init failed (ret=%d). "
 			"Is libnvm loaded? (insmod libnvm.ko)\n", ret);
@@ -510,9 +521,9 @@ static int fio_plink_getevents(struct thread_data *td, unsigned int min,
 			events = (unsigned int)new_events;
 			break;
 		}
-		/* 100 µs backoff — fio stats resolution is ms, so this is
+		/* 1 ms backoff — fio stats resolution is ms, so this is
 		 * plenty, and it keeps CPU-side pressure off the side stream. */
-		usleep(100);
+		usleep(1000);
 	}
 
 	return (int)events;
