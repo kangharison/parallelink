@@ -83,7 +83,6 @@ echo "    NVCC       = ${NVCC}"
 # ------------------------------------------------------------------
 rm -rf "${BAM_BUILD}"
 rm -rf "${PLINK_BUILD}"
-rm -rf "${NVME_CLI_BUILD}"
 
 
 # ------------------------------------------------------------------
@@ -97,17 +96,6 @@ for BAM_PATCH in "${ROOT}"/patches/bam-*.patch; do
         else
             echo "==> Applying ${BAM_PATCH}"
             git -C "${BAM_DIR}" apply "${BAM_PATCH}"
-        fi
-    fi
-done
-
-for NVME_CLI_PATCH in "${ROOT}"/patches/nvme-cli-*.patch; do
-    if [[ -f "${NVME_CLI_PATCH}" ]]; then
-        if git -C "${NVME_CLI_DIR}" apply --reverse --check "${NVME_CLI_PATCH}" >/dev/null 2>&1; then
-            echo "==> ${NVME_CLI_PATCH} already applied"
-        else
-            echo "==> Applying ${NVME_CLI_PATCH}"
-            git -C "${NVME_CLI_DIR}" apply "${NVME_CLI_PATCH}"
         fi
     fi
 done
@@ -257,17 +245,6 @@ if [[ ! -x "${NVME_BIN}" ]]; then
     exit 1
 fi
 cp -f "${NVME_BIN}" "${DIST}/nvme"
-
-# Convenience runner: wraps fio with FIO_EXT_ENG_DIR + LD_LIBRARY_PATH
-cat > "${DIST}/run-fio.sh" <<'RUN'
-#!/usr/bin/env bash
-# Launch the bundled fio with parallelink.so from this dist directory.
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export FIO_EXT_ENG_DIR="${HERE}"
-export LD_LIBRARY_PATH="${HERE}:${LD_LIBRARY_PATH:-}"
-exec "${HERE}/fio" "$@"
-RUN
-chmod +x "${DIST}/run-fio.sh"
 
 echo "==> Done. Artifacts in ${DIST}:"
 ls -lh "${DIST}"
