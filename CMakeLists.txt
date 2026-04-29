@@ -92,6 +92,7 @@ set_source_files_properties(src/gpu_worker.cu PROPERTIES
 
 target_link_libraries(parallelink PRIVATE
     CUDA::cudart
+    CUDA::curand
     ${LIBNVM_LIB}
     pthread
 )

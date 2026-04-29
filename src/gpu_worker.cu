@@ -11,7 +11,8 @@
  *   - Workload parameters (`struct plink_workload`) are passed BY VALUE as
  *     a kernel launch argument → parameter buffer → registers. Every field
  *     the I/O loop reads (opcode, ios_per_thread, n_blocks, lba_range,
- *     random) is in-register; zero memory traffic
+ *     random) is in-register; zero memory traffic (curand RNG state
+ *     also lives in registers)
  *     for workload config during the loop.
  *
  *   - The done counter (`d_done_count`) is pure device memory
@@ -33,6 +34,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <curand_kernel.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -118,27 +120,27 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	uint64_t lba_max = wl.lba_range;
 
 	uint64_t pending_done = 0;
-	uint64_t slba = tid * (uint64_t)wl.n_blocks;
+	uint64_t slba;
 	uint64_t lba_step;
 
+	curandState rng;
 	if (wl.random) {
-		/* PoC pseudo-random walk: each thread gets a tid-derived odd
-		 * stride. It avoids per-I/O division/modulo and is only meant to
-		 * scatter traffic enough for randread-style experiments. */
-		lba_step = ((tid * 1315423911ULL) | 1ULL) *
-			   (uint64_t)wl.n_blocks;
+		curand_init(1234ULL, tid, 0, &rng);
+		slba = 0;
+		lba_step = 0;
 	} else {
+		slba = tid * (uint64_t)wl.n_blocks;
 		lba_step = (uint64_t)wl.total_threads *
 			   (uint64_t)wl.n_blocks;
-	}
 
-	if (lba_max) {
-		if (slba + wl.n_blocks >= lba_max)
-			slba -= (slba / lba_max) * lba_max;
-		if (lba_step >= lba_max)
-			lba_step -= (lba_step / lba_max) * lba_max;
-		if (lba_step == 0)
-			lba_step = wl.n_blocks ? wl.n_blocks : 1;
+		if (lba_max) {
+			if (slba + wl.n_blocks >= lba_max)
+				slba -= (slba / lba_max) * lba_max;
+			if (lba_step >= lba_max)
+				lba_step -= (lba_step / lba_max) * lba_max;
+			if (lba_step == 0)
+				lba_step = wl.n_blocks ? wl.n_blocks : 1;
+		}
 	}
 
 	/*
@@ -153,15 +155,24 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 				break;
 		}
 
+		if (wl.random && lba_max > (uint64_t)wl.n_blocks) {
+			uint64_t bound = lba_max - (uint64_t)wl.n_blocks;
+			uint64_t r = ((uint64_t)curand(&rng) << 32) |
+				     (uint64_t)curand(&rng);
+			slba = r % bound;
+		}
+
 		if (wl.opcode == PLINK_OP_READ)
 			read_data(pc, qp, slba, wl.n_blocks, pc_entry);
 		else
 			write_data(pc, qp, slba, wl.n_blocks, pc_entry);
 
 		pending_done++;
-		slba += lba_step;
-		if (lba_max && slba >= lba_max)
-			slba -= lba_max;
+		if (!wl.random) {
+			slba += lba_step;
+			if (lba_max && slba >= lba_max)
+				slba -= lba_max;
+		}
 
 		if ((pending_done & 1023ULL) == 0) {
 			atomicAdd((unsigned long long *)d_done_count,
