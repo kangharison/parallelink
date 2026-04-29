@@ -99,6 +99,33 @@ static plink_gpu_ctx g_ctx = {};
  * preserving the same occupancy and scheduling shape keeps comparisons
  * against block-nvm meaningful.
  */
+/*
+ * next_slba — compute the starting LBA for the next I/O.
+ *
+ * Random:     two 32-bit curand() calls combined into a 64-bit value,
+ *             mod (lba_max - n_blocks) for uniform distribution.
+ * Sequential: linear stride with wraparound.
+ *
+ * Inlined by nvcc (device functions are inlined by default), so this
+ * is purely organizational — zero call overhead.
+ */
+__device__ uint64_t next_slba(int random, curandState *rng,
+			      uint64_t slba, uint64_t lba_step,
+			      uint64_t lba_max, uint32_t n_blocks)
+{
+	if (random) {
+		uint64_t bound = lba_max - (uint64_t)n_blocks;
+		uint64_t r = ((uint64_t)curand(rng) << 32) |
+			     (uint64_t)curand(rng);
+		return r % bound;
+	}
+
+	slba += lba_step;
+	if (lba_max && slba >= lba_max)
+		slba -= lba_max;
+	return slba;
+}
+
 __global__ __launch_bounds__(64, 32)
 void plink_io_worker(struct plink_ctrl_block *ctrl,
 		     uint64_t *d_done_count,
@@ -126,8 +153,8 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	curandState rng;
 	if (wl.random) {
 		curand_init(1234ULL, tid, 0, &rng);
-		slba = 0;
 		lba_step = 0;
+		slba = next_slba(1, &rng, 0, 0, lba_max, wl.n_blocks);
 	} else {
 		slba = tid * (uint64_t)wl.n_blocks;
 		lba_step = (uint64_t)wl.total_threads *
@@ -155,24 +182,14 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 				break;
 		}
 
-		if (wl.random && lba_max > (uint64_t)wl.n_blocks) {
-			uint64_t bound = lba_max - (uint64_t)wl.n_blocks;
-			uint64_t r = ((uint64_t)curand(&rng) << 32) |
-				     (uint64_t)curand(&rng);
-			slba = r % bound;
-		}
-
 		if (wl.opcode == PLINK_OP_READ)
 			read_data(pc, qp, slba, wl.n_blocks, pc_entry);
 		else
 			write_data(pc, qp, slba, wl.n_blocks, pc_entry);
 
 		pending_done++;
-		if (!wl.random) {
-			slba += lba_step;
-			if (lba_max && slba >= lba_max)
-				slba -= lba_max;
-		}
+		slba = next_slba(wl.random, &rng, slba, lba_step,
+				 lba_max, wl.n_blocks);
 
 		if ((pending_done & 1023ULL) == 0) {
 			atomicAdd((unsigned long long *)d_done_count,
