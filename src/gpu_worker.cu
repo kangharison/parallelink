@@ -86,13 +86,17 @@ struct plink_gpu_ctx {
 static plink_gpu_ctx g_ctx = {};
 
 /* ------------------------------------------------------------------ */
-/*  Persistent I/O kernel                                             */
+/*  Persistent I/O kernels (random / sequential)                      */
 /* ------------------------------------------------------------------ */
 /*
+ * Two specialized kernels replace the former branching plink_io_worker.
+ * plink_gpu_launch() dispatches based on wl.random so the hot loop in
+ * each kernel is branch-free for its access pattern.
+ *
  * Each thread picks a queue-pair and a page-cache slot and issues
- * ios_per_thread NVMe commands via BaM's read_data/write_data device
- * helpers. Those helpers internally build the command, set PRPs from
- * pc->prp1/prp2, do sq_enqueue + cq_poll + cq_dequeue, and release cid.
+ * NVMe commands via BaM's read_data/write_data device helpers. Those
+ * helpers internally build the command, set PRPs from pc->prp1/prp2,
+ * do sq_enqueue + cq_poll + cq_dequeue, and release cid.
  *
  * Launch bounds and block shape match BaM's block benchmark. BaM's queue
  * primitives spin on device-wide atomics with __nanosleep backoff, so
@@ -100,12 +104,12 @@ static plink_gpu_ctx g_ctx = {};
  * against block-nvm meaningful.
  */
 __global__ __launch_bounds__(64, 32)
-void plink_io_worker(struct plink_ctrl_block *ctrl,
-		     uint64_t *d_done_count,
-		     struct plink_workload wl,
-		     Controller **ctrls,
-		     page_cache_d_t *pc,
-		     int n_queues)
+void plink_io_worker_random(struct plink_ctrl_block *ctrl,
+			    uint64_t *d_done_count,
+			    struct plink_workload wl,
+			    Controller **ctrls,
+			    page_cache_d_t *pc,
+			    int n_queues)
 {
 	uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
 	if (tid >= (uint64_t)wl.total_threads)
@@ -114,48 +118,21 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 	int q_idx = (tid / 32) % n_queues;
 	QueuePair *qp = &(ctrls[0]->d_qps[q_idx]);
 
-	/* Each thread owns one distinct page-cache slot for its in-flight I/O. */
 	uint64_t pc_entry = (uint64_t)tid % pc->n_pages;
-
 	uint64_t lba_max = wl.lba_range;
-
 	uint64_t pending_done = 0;
-	uint64_t slba;
-	uint64_t lba_step;
+	uint64_t slba = 0;
 
 	curandState rng;
-	if (wl.random) {
-		curand_init(1234ULL, tid, 0, &rng);
-		slba = 0;
-		lba_step = 0;
-	} else {
-		slba = tid * (uint64_t)wl.n_blocks;
-		lba_step = (uint64_t)wl.total_threads *
-			   (uint64_t)wl.n_blocks;
+	curand_init(1234ULL, tid, 0, &rng);
 
-		if (lba_max) {
-			if (slba + wl.n_blocks >= lba_max)
-				slba -= (slba / lba_max) * lba_max;
-			if (lba_step >= lba_max)
-				lba_step -= (lba_step / lba_max) * lba_max;
-			if (lba_step == 0)
-				lba_step = wl.n_blocks ? wl.n_blocks : 1;
-		}
-	}
-
-	/*
-	 * The kernel runs until the CPU signals shutdown. fio's keep_running()
-	 * decides when the job ends and then plink_gpu_shutdown() writes the
-	 * pinned ctrl flag. Each shutdown read is a PCIe round-trip to host
-	 * memory, so we amortize by polling once every 1024 I/Os.
-	 */
 	while (true) {
 		if ((pending_done & 1023ULL) == 0) {
 			if (ctrl->shutdown)
 				break;
 		}
 
-		if (wl.random && lba_max > (uint64_t)wl.n_blocks) {
+		if (lba_max > (uint64_t)wl.n_blocks) {
 			uint64_t bound = lba_max - (uint64_t)wl.n_blocks;
 			uint64_t r = ((uint64_t)curand(&rng) << 32) |
 				     (uint64_t)curand(&rng);
@@ -168,11 +145,6 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 			write_data(pc, qp, slba, wl.n_blocks, pc_entry);
 
 		pending_done++;
-		if (!wl.random) {
-			slba += lba_step;
-			if (lba_max && slba >= lba_max)
-				slba -= lba_max;
-		}
 
 		if ((pending_done & 1023ULL) == 0) {
 			atomicAdd((unsigned long long *)d_done_count,
@@ -180,7 +152,69 @@ void plink_io_worker(struct plink_ctrl_block *ctrl,
 			pending_done = 0;
 		}
 
-		// Explicit synchronization is required, idk why
+		__syncwarp();
+	}
+
+	if (pending_done)
+		atomicAdd((unsigned long long *)d_done_count,
+			  (unsigned long long)pending_done);
+}
+
+__global__ __launch_bounds__(64, 32)
+void plink_io_worker_sequential(struct plink_ctrl_block *ctrl,
+				uint64_t *d_done_count,
+				struct plink_workload wl,
+				Controller **ctrls,
+				page_cache_d_t *pc,
+				int n_queues)
+{
+	uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+	if (tid >= (uint64_t)wl.total_threads)
+		return;
+
+	int q_idx = (tid / 32) % n_queues;
+	QueuePair *qp = &(ctrls[0]->d_qps[q_idx]);
+
+	uint64_t pc_entry = (uint64_t)tid % pc->n_pages;
+	uint64_t lba_max = wl.lba_range;
+	uint64_t pending_done = 0;
+
+	uint64_t slba = tid * (uint64_t)wl.n_blocks;
+	uint64_t lba_step = (uint64_t)wl.total_threads *
+			    (uint64_t)wl.n_blocks;
+
+	if (lba_max) {
+		if (slba + wl.n_blocks >= lba_max)
+			slba -= (slba / lba_max) * lba_max;
+		if (lba_step >= lba_max)
+			lba_step -= (lba_step / lba_max) * lba_max;
+		if (lba_step == 0)
+			lba_step = wl.n_blocks ? wl.n_blocks : 1;
+	}
+
+	while (true) {
+		if ((pending_done & 1023ULL) == 0) {
+			if (ctrl->shutdown)
+				break;
+		}
+
+		if (wl.opcode == PLINK_OP_READ)
+			read_data(pc, qp, slba, wl.n_blocks, pc_entry);
+		else
+			write_data(pc, qp, slba, wl.n_blocks, pc_entry);
+
+		pending_done++;
+
+		slba += lba_step;
+		if (lba_max && slba >= lba_max)
+			slba -= lba_max;
+
+		if ((pending_done & 1023ULL) == 0) {
+			atomicAdd((unsigned long long *)d_done_count,
+				  (unsigned long long)pending_done);
+			pending_done = 0;
+		}
+
 		__syncwarp();
 	}
 
@@ -348,9 +382,17 @@ extern "C" int plink_gpu_launch(struct plink_shared_state *state,
 	int blocks = (g_ctx.total_threads + threads_per_block - 1)
 		     / threads_per_block;
 
-	plink_io_worker<<<blocks, threads_per_block, 0, g_ctx.compute_stream>>>(
-		g_ctx.d_ctrl, g_ctx.d_done_count, wl,
-		g_ctx.d_ctrls, g_ctx.d_pc, n_queues);
+	if (wl.random) {
+		plink_io_worker_random<<<blocks, threads_per_block, 0,
+			g_ctx.compute_stream>>>(
+				g_ctx.d_ctrl, g_ctx.d_done_count, wl,
+				g_ctx.d_ctrls, g_ctx.d_pc, n_queues);
+	} else {
+		plink_io_worker_sequential<<<blocks, threads_per_block, 0,
+			g_ctx.compute_stream>>>(
+				g_ctx.d_ctrl, g_ctx.d_done_count, wl,
+				g_ctx.d_ctrls, g_ctx.d_pc, n_queues);
+	}
 
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) {
