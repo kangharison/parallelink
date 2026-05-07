@@ -151,8 +151,6 @@ void plink_io_worker_random(struct plink_ctrl_block *ctrl,
 				  (unsigned long long)pending_done);
 			pending_done = 0;
 		}
-
-		__syncwarp();
 	}
 
 	if (pending_done)
