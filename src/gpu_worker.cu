@@ -119,25 +119,22 @@ void plink_io_worker_random(struct plink_ctrl_block *ctrl,
 	QueuePair *qp = &(ctrls[0]->d_qps[q_idx]);
 
 	uint64_t pc_entry = (uint64_t)tid % pc->n_pages;
-	uint64_t lba_max = wl.lba_range;
-	uint64_t pending_done = 0;
+	uint64_t lba_max = wl.lba_range - (uint64_t)wl.n_blocks;
 	uint64_t slba = 0;
 
 	curandState rng;
 	curand_init(1234ULL, tid, 0, &rng);
 
+	uint64_t pending_done = 0;
 	while (true) {
 		if ((pending_done & 1023ULL) == 0) {
 			if (ctrl->shutdown)
 				break;
 		}
 
-		if (lba_max > (uint64_t)wl.n_blocks) {
-			uint64_t bound = lba_max - (uint64_t)wl.n_blocks;
-			uint64_t r = ((uint64_t)curand(&rng) << 32) |
-				     (uint64_t)curand(&rng);
-			slba = r % bound;
-		}
+		uint64_t r = ((uint64_t)curand(&rng) << 32) |
+				(uint64_t)curand(&rng);
+		slba = r % lba_max;
 
 		if (wl.opcode == PLINK_OP_READ)
 			read_data(pc, qp, slba, wl.n_blocks, pc_entry);
